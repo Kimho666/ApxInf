@@ -2,15 +2,15 @@
   "cublas_version": "12.8.4",
   "cuda_version": "12.8",
   "device_name": "NVIDIA GeForce RTX 4090",
-  "kernel_build_id": "kb1-cbd5c74a0104746104ab8ab6b5380f71",
+  "kernel_build_id": "kb1-d086732641341342b09ec105ab9ad7ef",
   "records": [
     {
       "candidates": {
-        "cublaslt_best_ms": 0.008713600225746632,
+        "cublaslt_best_ms": 0.0089045325294137,
         "cublaslt_best_rank": 2,
-        "cublaslt_default_ms": 0.009253333322703838,
+        "cublaslt_default_ms": 0.009178666397929192,
         "cublaslt_returned_algorithms": 10,
-        "vendor_ms": 0.009251200221478939
+        "vendor_ms": 0.009317333561678727
       },
       "key": {
         "activation_dtype": "bf16",
@@ -25,7 +25,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.008713600225746632,
+      "milliseconds": 0.0089045325294137,
       "profiles": [
         "2v/t10/time.mlp_in",
         "2v/t10/time.mlp_out",
@@ -51,11 +51,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.014837331138551235,
+        "cublaslt_best_ms": 0.014680531807243824,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.016519470140337944,
+        "cublaslt_default_ms": 0.016724269837141037,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.016414933279156683
+        "vendor_ms": 0.016250666634490093
       },
       "key": {
         "activation_dtype": "bf16",
@@ -70,7 +70,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.014837331138551235,
+      "milliseconds": 0.014680531807243824,
       "profiles": [
         "2v/t10/action.ada_style",
         "2v/t21/action.ada_style",
@@ -88,11 +88,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.0064842673018574715,
+        "cublaslt_best_ms": 0.006444800179451704,
         "cublaslt_best_rank": 2,
-        "cublaslt_default_ms": 0.016494937241077423,
+        "cublaslt_default_ms": 0.016724267974495888,
         "cublaslt_returned_algorithms": 7,
-        "vendor_ms": 0.016555733295778433
+        "vendor_ms": 0.022731733384231727
       },
       "key": {
         "activation_dtype": "bf16",
@@ -107,7 +107,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.0064842673018574715,
+      "milliseconds": 0.006444800179451704,
       "profiles": [
         "2v/t10/action.output",
         "2v/t21/action.output",
@@ -125,11 +125,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.004131200723350048,
+        "cublaslt_best_ms": 0.004128000698983669,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.004131200723350048,
+        "cublaslt_default_ms": 0.004128000698983669,
         "cublaslt_returned_algorithms": 6,
-        "vendor_ms": 0.00420053331181407
+        "vendor_ms": 0.004157866661747296
       },
       "key": {
         "activation_dtype": "bf16",
@@ -144,7 +144,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.004131200723350048,
+      "milliseconds": 0.004128000698983669,
       "profiles": [
         "2v/t10/action.input",
         "2v/t21/action.input",
@@ -162,11 +162,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.013864533044397831,
+        "cublaslt_best_ms": 0.014008534140884876,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.020478935912251472,
+        "cublaslt_default_ms": 0.02091732993721962,
         "cublaslt_returned_algorithms": 7,
-        "vendor_ms": 0.020900266369183858
+        "vendor_ms": 0.02098773295680682
       },
       "key": {
         "activation_dtype": "bf16",
@@ -181,7 +181,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.013864533044397831,
+      "milliseconds": 0.014008534140884876,
       "profiles": [
         "2v/t10/action.attention_out",
         "2v/t21/action.attention_out",
@@ -199,11 +199,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.020794667303562164,
+        "cublaslt_best_ms": 0.020689066499471664,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.020794667303562164,
+        "cublaslt_default_ms": 0.020689066499471664,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.020655999643107256
+        "vendor_ms": 0.020661332954963047
       },
       "key": {
         "activation_dtype": "bf16",
@@ -218,7 +218,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.020655999643107256,
+      "milliseconds": 0.020661332954963047,
       "profiles": [
         "2v/t10/action.down",
         "2v/t21/action.down",
@@ -236,11 +236,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.016994139179587364,
+        "cublaslt_best_ms": 0.017097603529691696,
         "cublaslt_best_rank": 5,
-        "cublaslt_default_ms": 0.01929493434727192,
+        "cublaslt_default_ms": 0.019591467455029488,
         "cublaslt_returned_algorithms": 7,
-        "vendor_ms": 0.01946239937096834
+        "vendor_ms": 0.019459199408690134
       },
       "key": {
         "activation_dtype": "bf16",
@@ -255,7 +255,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.016994139179587364,
+      "milliseconds": 0.017097603529691696,
       "profiles": [
         "2v/t10/action.qkv",
         "2v/t21/action.qkv",
@@ -273,11 +273,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.02915305644273758,
+        "cublaslt_best_ms": 0.02922986075282097,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.02915305644273758,
+        "cublaslt_default_ms": 0.02922986075282097,
         "cublaslt_returned_algorithms": 7,
-        "vendor_ms": 0.02941866728166739
+        "vendor_ms": 0.029429333843290807
       },
       "key": {
         "activation_dtype": "bf16",
@@ -292,7 +292,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.02915305644273758,
+      "milliseconds": 0.02922986075282097,
       "profiles": [
         "2v/t10/action.gate_up",
         "2v/t21/action.gate_up",
@@ -310,11 +310,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.01303893607109785,
+        "cublaslt_best_ms": 0.012972802855074406,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.01303893607109785,
+        "cublaslt_default_ms": 0.012972802855074406,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.012936533397684495
+        "vendor_ms": 0.012836266743640105
       },
       "key": {
         "activation_dtype": "bf16",
@@ -329,7 +329,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.012936533397684495,
+      "milliseconds": 0.012836266743640105,
       "profiles": [
         "2v/t10/vision.patch",
         "2v/t21/vision.patch",
@@ -343,11 +343,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.019114669412374496,
+        "cublaslt_best_ms": 0.01934720203280449,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.01982506923377514,
+        "cublaslt_default_ms": 0.019833600148558617,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.019729065957168737
+        "vendor_ms": 0.019795199297368525
       },
       "key": {
         "activation_dtype": "bf16",
@@ -362,7 +362,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.019114669412374496,
+      "milliseconds": 0.01934720203280449,
       "profiles": [
         "2v/t10/vision.attention_out",
         "2v/t21/vision.attention_out",
@@ -376,11 +376,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.04619946330785751,
+        "cublaslt_best_ms": 0.04621546342968941,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.04619946330785751,
+        "cublaslt_default_ms": 0.04621546342968941,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.04619200080633164
+        "vendor_ms": 0.046358400707443556
       },
       "key": {
         "activation_dtype": "bf16",
@@ -395,7 +395,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.04619200080633164,
+      "milliseconds": 0.04621546342968941,
       "profiles": [
         "2v/t10/vision.fc2",
         "2v/t21/vision.fc2",
@@ -403,17 +403,17 @@
         "2v/t200/vision.fc2"
       ],
       "tactic": {
-        "backend": "vendor",
+        "backend": "cublaslt",
         "id": 0
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.020307201892137527,
+        "cublaslt_best_ms": 0.020479999482631683,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.020307201892137527,
+        "cublaslt_default_ms": 0.020479999482631683,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.020418132841587066
+        "vendor_ms": 0.020404266193509102
       },
       "key": {
         "activation_dtype": "bf16",
@@ -428,7 +428,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.020307201892137527,
+      "milliseconds": 0.020404266193509102,
       "profiles": [
         "2v/t10/vision.projector",
         "2v/t21/vision.projector",
@@ -436,17 +436,17 @@
         "2v/t200/vision.projector"
       ],
       "tactic": {
-        "backend": "cublaslt",
+        "backend": "vendor",
         "id": 0
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.03518826887011528,
-        "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.037349335849285126,
+        "cublaslt_best_ms": 0.035630930215120316,
+        "cublaslt_best_rank": 2,
+        "cublaslt_default_ms": 0.03779200091958046,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.03752000120778878
+        "vendor_ms": 0.037888001278042795
       },
       "key": {
         "activation_dtype": "bf16",
@@ -461,7 +461,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.03518826887011528,
+      "milliseconds": 0.035630930215120316,
       "profiles": [
         "2v/t10/vision.qkv",
         "2v/t21/vision.qkv",
@@ -470,16 +470,16 @@
       ],
       "tactic": {
         "backend": "cublaslt",
-        "id": 1
+        "id": 2
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.04325011745095253,
+        "cublaslt_best_ms": 0.043449584394693375,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.0467701330780983,
+        "cublaslt_default_ms": 0.0466645322740078,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.0467264009018739
+        "vendor_ms": 0.04690560102462769
       },
       "key": {
         "activation_dtype": "bf16",
@@ -494,7 +494,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.04325011745095253,
+      "milliseconds": 0.043449584394693375,
       "profiles": [
         "2v/t10/vision.fc1",
         "2v/t21/vision.fc1",
@@ -508,11 +508,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.041309867054224014,
+        "cublaslt_best_ms": 0.04160746559500694,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.041309867054224014,
+        "cublaslt_default_ms": 0.04160746559500694,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.041433599094549814
+        "vendor_ms": 0.04129493236541748
       },
       "key": {
         "activation_dtype": "bf16",
@@ -527,22 +527,22 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.041309867054224014,
+      "milliseconds": 0.04129493236541748,
       "profiles": [
         "2v/t10/language.attention_out"
       ],
       "tactic": {
-        "backend": "cublaslt",
+        "backend": "vendor",
         "id": 0
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.2476106733083725,
+        "cublaslt_best_ms": 0.24882778525352478,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.2642272114753723,
+        "cublaslt_default_ms": 0.25828906893730164,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.26402879257996875
+        "vendor_ms": 0.2583893338839213
       },
       "key": {
         "activation_dtype": "bf16",
@@ -557,7 +557,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.2476106733083725,
+      "milliseconds": 0.24882778525352478,
       "profiles": [
         "2v/t10/language.down"
       ],
@@ -568,11 +568,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.04560106247663498,
+        "cublaslt_best_ms": 0.04571092873811722,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.04560106247663498,
+        "cublaslt_default_ms": 0.04571092873811722,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.046038400505979855
+        "vendor_ms": 0.04570240055521329
       },
       "key": {
         "activation_dtype": "bf16",
@@ -587,22 +587,22 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.04560106247663498,
+      "milliseconds": 0.04570240055521329,
       "profiles": [
         "2v/t10/language.qkv"
       ],
       "tactic": {
-        "backend": "cublaslt",
+        "backend": "vendor",
         "id": 0
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.47694510221481323,
+        "cublaslt_best_ms": 0.4794761836528778,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.47694510221481323,
+        "cublaslt_default_ms": 0.4794761836528778,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.4769482632478078
+        "vendor_ms": 0.4796085387468338
       },
       "key": {
         "activation_dtype": "bf16",
@@ -617,7 +617,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.47694510221481323,
+      "milliseconds": 0.4794761836528778,
       "profiles": [
         "2v/t10/language.gate_up"
       ],
@@ -628,11 +628,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.04161493107676506,
+        "cublaslt_best_ms": 0.041874125599861145,
         "cublaslt_best_rank": 2,
-        "cublaslt_default_ms": 0.04216533154249191,
+        "cublaslt_default_ms": 0.04228266328573227,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.04222293272614479
+        "vendor_ms": 0.04232853278517723
       },
       "key": {
         "activation_dtype": "bf16",
@@ -647,7 +647,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.04161493107676506,
+      "milliseconds": 0.041874125599861145,
       "profiles": [
         "2v/t21/language.attention_out"
       ],
@@ -658,11 +658,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.2490411400794983,
+        "cublaslt_best_ms": 0.2500661611557007,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.2657930552959442,
+        "cublaslt_default_ms": 0.26746881008148193,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.26589546402295433
+        "vendor_ms": 0.2674250682195028
       },
       "key": {
         "activation_dtype": "bf16",
@@ -677,7 +677,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.2490411400794983,
+      "milliseconds": 0.2500661611557007,
       "profiles": [
         "2v/t21/language.down"
       ],
@@ -688,11 +688,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.045906126499176025,
+        "cublaslt_best_ms": 0.046246398240327835,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.045906126499176025,
+        "cublaslt_default_ms": 0.046246398240327835,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.04604373400410016
+        "vendor_ms": 0.04608106737335523
       },
       "key": {
         "activation_dtype": "bf16",
@@ -707,22 +707,22 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.045906126499176025,
+      "milliseconds": 0.04608106737335523,
       "profiles": [
         "2v/t21/language.qkv"
       ],
       "tactic": {
-        "backend": "cublaslt",
+        "backend": "vendor",
         "id": 0
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.47803831100463867,
+        "cublaslt_best_ms": 0.48316046595573425,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.47803831100463867,
+        "cublaslt_default_ms": 0.48316046595573425,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.4775914678970973
+        "vendor_ms": 0.4833280086517334
       },
       "key": {
         "activation_dtype": "bf16",
@@ -737,22 +737,22 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.4775914678970973,
+      "milliseconds": 0.48316046595573425,
       "profiles": [
         "2v/t21/language.gate_up"
       ],
       "tactic": {
-        "backend": "vendor",
+        "backend": "cublaslt",
         "id": 0
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.042697593569755554,
-        "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.042697593569755554,
+        "cublaslt_best_ms": 0.042877864092588425,
+        "cublaslt_best_rank": 2,
+        "cublaslt_default_ms": 0.043447453528642654,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.042357332756121954
+        "vendor_ms": 0.04328639979163806
       },
       "key": {
         "activation_dtype": "bf16",
@@ -767,22 +767,22 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.042357332756121954,
+      "milliseconds": 0.042877864092588425,
       "profiles": [
         "2v/t50/language.attention_out"
       ],
       "tactic": {
-        "backend": "vendor",
-        "id": 0
+        "backend": "cublaslt",
+        "id": 2
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.24964803457260132,
+        "cublaslt_best_ms": 0.25049924850463867,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.26856106519699097,
+        "cublaslt_default_ms": 0.27391359210014343,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.26914452711741127
+        "vendor_ms": 0.2738858660062154
       },
       "key": {
         "activation_dtype": "bf16",
@@ -797,7 +797,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.24964803457260132,
+      "milliseconds": 0.25049924850463867,
       "profiles": [
         "2v/t50/language.down"
       ],
@@ -808,11 +808,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.04645546153187752,
+        "cublaslt_best_ms": 0.046324264258146286,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.04645546153187752,
+        "cublaslt_default_ms": 0.046324264258146286,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.046522667383154234
+        "vendor_ms": 0.047005867461363475
       },
       "key": {
         "activation_dtype": "bf16",
@@ -827,7 +827,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.04645546153187752,
+      "milliseconds": 0.046324264258146286,
       "profiles": [
         "2v/t50/language.qkv"
       ],
@@ -838,11 +838,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.49206721782684326,
+        "cublaslt_best_ms": 0.4948970377445221,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.49206721782684326,
+        "cublaslt_default_ms": 0.4948970377445221,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.49223999480406444
+        "vendor_ms": 0.4949696004390717
       },
       "key": {
         "activation_dtype": "bf16",
@@ -857,7 +857,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.49206721782684326,
+      "milliseconds": 0.4948970377445221,
       "profiles": [
         "2v/t50/language.gate_up"
       ],
@@ -868,11 +868,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.04922346770763397,
+        "cublaslt_best_ms": 0.047096531838178635,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.04922346770763397,
+        "cublaslt_default_ms": 0.047096531838178635,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.049328000470995906
+        "vendor_ms": 0.04768533408641815
       },
       "key": {
         "activation_dtype": "bf16",
@@ -887,7 +887,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.04922346770763397,
+      "milliseconds": 0.047096531838178635,
       "profiles": [
         "2v/t200/language.attention_out"
       ],
@@ -898,11 +898,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.3062560260295868,
+        "cublaslt_best_ms": 0.3131018579006195,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.3438261151313782,
+        "cublaslt_default_ms": 0.35144099593162537,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.3438303957382838
+        "vendor_ms": 0.3511935998996099
       },
       "key": {
         "activation_dtype": "bf16",
@@ -917,7 +917,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.3062560260295868,
+      "milliseconds": 0.3131018579006195,
       "profiles": [
         "2v/t200/language.down"
       ],
@@ -928,11 +928,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.05553385242819786,
+        "cublaslt_best_ms": 0.05546451732516289,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.05553385242819786,
+        "cublaslt_default_ms": 0.05546451732516289,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.05541013355056445
+        "vendor_ms": 0.05530240014195442
       },
       "key": {
         "activation_dtype": "bf16",
@@ -947,7 +947,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.05541013355056445,
+      "milliseconds": 0.05530240014195442,
       "profiles": [
         "2v/t200/language.qkv"
       ],
@@ -958,11 +958,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.5913259387016296,
+        "cublaslt_best_ms": 0.5922474265098572,
         "cublaslt_best_rank": 2,
-        "cublaslt_default_ms": 0.6224896311759949,
+        "cublaslt_default_ms": 0.6175817847251892,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.616483187675476
+        "vendor_ms": 0.6175114611784617
       },
       "key": {
         "activation_dtype": "bf16",
@@ -977,7 +977,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.5913259387016296,
+      "milliseconds": 0.5922474265098572,
       "profiles": [
         "2v/t200/language.gate_up"
       ],
@@ -988,11 +988,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.013610667549073696,
+        "cublaslt_best_ms": 0.013687467202544212,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.013610667549073696,
+        "cublaslt_default_ms": 0.013687467202544212,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.013535999972373248
+        "vendor_ms": 0.013564799974362055
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1007,7 +1007,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.013535999972373248,
+      "milliseconds": 0.013564799974362055,
       "profiles": [
         "3v/t10/vision.patch",
         "3v/t21/vision.patch",
@@ -1021,11 +1021,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.019589336588978767,
+        "cublaslt_best_ms": 0.019788801670074463,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.019589336588978767,
+        "cublaslt_default_ms": 0.019788801670074463,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.019502932702501617
+        "vendor_ms": 0.01945173256099224
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1040,7 +1040,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.019502932702501617,
+      "milliseconds": 0.01945173256099224,
       "profiles": [
         "3v/t10/vision.attention_out",
         "3v/t21/vision.attention_out",
@@ -1054,11 +1054,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.061382394284009933,
+        "cublaslt_best_ms": 0.06163306161761284,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.07802880555391312,
+        "cublaslt_default_ms": 0.07850345224142075,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.07902186413606008
+        "vendor_ms": 0.07837973088026047
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1073,7 +1073,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.061382394284009933,
+      "milliseconds": 0.06163306161761284,
       "profiles": [
         "3v/t10/vision.fc2",
         "3v/t21/vision.fc2",
@@ -1087,11 +1087,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.033796269446611404,
+        "cublaslt_best_ms": 0.03385600820183754,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.033796269446611404,
+        "cublaslt_default_ms": 0.03385600820183754,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.0337226668993632
+        "vendor_ms": 0.033756800244251886
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1106,7 +1106,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.0337226668993632,
+      "milliseconds": 0.033756800244251886,
       "profiles": [
         "3v/t10/vision.projector",
         "3v/t21/vision.projector",
@@ -1120,11 +1120,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.048883210867643356,
+        "cublaslt_best_ms": 0.04893973842263222,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.05091840773820877,
+        "cublaslt_default_ms": 0.05100799724459648,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.050821332012613615
+        "vendor_ms": 0.051034665356079735
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1139,7 +1139,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.048883210867643356,
+      "milliseconds": 0.04893973842263222,
       "profiles": [
         "3v/t10/vision.qkv",
         "3v/t21/vision.qkv",
@@ -1153,11 +1153,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.05863892287015915,
+        "cublaslt_best_ms": 0.058647457510232925,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.05863892287015915,
+        "cublaslt_default_ms": 0.058647457510232925,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.058513067786892255
+        "vendor_ms": 0.05874453422923883
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1172,7 +1172,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.058513067786892255,
+      "milliseconds": 0.058647457510232925,
       "profiles": [
         "3v/t10/vision.fc1",
         "3v/t21/vision.fc1",
@@ -1180,17 +1180,17 @@
         "3v/t200/vision.fc1"
       ],
       "tactic": {
-        "backend": "vendor",
+        "backend": "cublaslt",
         "id": 0
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.05427735671401024,
+        "cublaslt_best_ms": 0.05451841652393341,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.05609385669231415,
+        "cublaslt_default_ms": 0.06212158128619194,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.05636053383350372
+        "vendor_ms": 0.05654826710621516
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1205,7 +1205,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.05427735671401024,
+      "milliseconds": 0.05451841652393341,
       "profiles": [
         "3v/t10/language.attention_out"
       ],
@@ -1216,11 +1216,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.35269755125045776,
+        "cublaslt_best_ms": 0.3525642156600952,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.37795841693878174,
+        "cublaslt_default_ms": 0.37464430928230286,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.37805759608745576
+        "vendor_ms": 0.3744138697783152
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1235,7 +1235,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.35269755125045776,
+      "milliseconds": 0.3525642156600952,
       "profiles": [
         "3v/t10/language.down"
       ],
@@ -1246,11 +1246,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.0684032216668129,
+        "cublaslt_best_ms": 0.06765440851449966,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.0684032216668129,
+        "cublaslt_default_ms": 0.06765440851449966,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.06856640080610911
+        "vendor_ms": 0.06782080059250196
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1265,7 +1265,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.0684032216668129,
+      "milliseconds": 0.06765440851449966,
       "profiles": [
         "3v/t10/language.qkv"
       ],
@@ -1276,11 +1276,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.6869716644287109,
+        "cublaslt_best_ms": 0.6878537535667419,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.6989963054656982,
+        "cublaslt_default_ms": 0.6996330618858337,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.699044281244278
+        "vendor_ms": 0.6994592189788819
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1295,7 +1295,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.6869716644287109,
+      "milliseconds": 0.6878537535667419,
       "profiles": [
         "3v/t10/language.gate_up"
       ],
@@ -1306,11 +1306,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.054541878402233124,
+        "cublaslt_best_ms": 0.054826658219099045,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.05564264953136444,
+        "cublaslt_default_ms": 0.05574611574411392,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.05557333355148633
+        "vendor_ms": 0.05586453353365262
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1325,7 +1325,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.054541878402233124,
+      "milliseconds": 0.054826658219099045,
       "profiles": [
         "3v/t21/language.attention_out"
       ],
@@ -1336,11 +1336,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.3528052866458893,
+        "cublaslt_best_ms": 0.3528309166431427,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.3795871436595917,
+        "cublaslt_default_ms": 0.3800351023674011,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.3797023991743724
+        "vendor_ms": 0.3802762687206268
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1355,7 +1355,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.3528052866458893,
+      "milliseconds": 0.3528309166431427,
       "profiles": [
         "3v/t21/language.down"
       ],
@@ -1366,11 +1366,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.06761494278907776,
+        "cublaslt_best_ms": 0.06792854517698288,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.06761494278907776,
+        "cublaslt_default_ms": 0.06792854517698288,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.06816213404138884
+        "vendor_ms": 0.06826133405168851
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1385,7 +1385,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.06761494278907776,
+      "milliseconds": 0.06792854517698288,
       "profiles": [
         "3v/t21/language.qkv"
       ],
@@ -1396,11 +1396,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.6871668696403503,
+        "cublaslt_best_ms": 0.6884052157402039,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.7031786441802979,
+        "cublaslt_default_ms": 0.7035156488418579,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.7029909253120422
+        "vendor_ms": 0.703142390648524
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1415,7 +1415,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.6871668696403503,
+      "milliseconds": 0.6884052157402039,
       "profiles": [
         "3v/t21/language.gate_up"
       ],
@@ -1426,11 +1426,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.054713599383831024,
+        "cublaslt_best_ms": 0.05475306883454323,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.05645652115345001,
+        "cublaslt_default_ms": 0.05656745657324791,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.056522667159636816
+        "vendor_ms": 0.056600533922513324
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1445,7 +1445,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.054713599383831024,
+      "milliseconds": 0.05475306883454323,
       "profiles": [
         "3v/t50/language.attention_out"
       ],
@@ -1456,11 +1456,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.3529419004917145,
+        "cublaslt_best_ms": 0.35440537333488464,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.3854709565639496,
+        "cublaslt_default_ms": 0.3889845013618469,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.3855360011259715
+        "vendor_ms": 0.38786666889985405
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1475,7 +1475,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.3529419004917145,
+      "milliseconds": 0.35440537333488464,
       "profiles": [
         "3v/t50/language.down"
       ],
@@ -1486,11 +1486,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.06895575672388077,
+        "cublaslt_best_ms": 0.06882241368293762,
         "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.06901974976062775,
+        "cublaslt_default_ms": 0.06884694844484329,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.06935573443770408
+        "vendor_ms": 0.06902293438712756
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1505,7 +1505,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.06895575672388077,
+      "milliseconds": 0.06882241368293762,
       "profiles": [
         "3v/t50/language.qkv"
       ],
@@ -1516,11 +1516,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.6872373223304749,
+        "cublaslt_best_ms": 0.6897386312484741,
         "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.7136256098747253,
+        "cublaslt_default_ms": 0.7180298566818237,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.7197738786538442
+        "vendor_ms": 0.7182357211907705
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1535,7 +1535,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.6872373223304749,
+      "milliseconds": 0.6897386312484741,
       "profiles": [
         "3v/t50/language.gate_up"
       ],
@@ -1546,11 +1546,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.05513278767466545,
+        "cublaslt_best_ms": 0.05532904714345932,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.05513278767466545,
+        "cublaslt_default_ms": 0.05532904714345932,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.05519253338376681
+        "vendor_ms": 0.05532586673895518
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1565,22 +1565,22 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.05513278767466545,
+      "milliseconds": 0.05532586673895518,
       "profiles": [
         "3v/t200/language.attention_out"
       ],
       "tactic": {
-        "backend": "cublaslt",
+        "backend": "vendor",
         "id": 0
       }
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.4064043164253235,
+        "cublaslt_best_ms": 0.4077802300453186,
         "cublaslt_best_rank": 6,
-        "cublaslt_default_ms": 0.46509018540382385,
+        "cublaslt_default_ms": 0.4669087827205658,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.46397865811983746
+        "vendor_ms": 0.4668373386065165
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1595,7 +1595,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.4064043164253235,
+      "milliseconds": 0.4077802300453186,
       "profiles": [
         "3v/t200/language.down"
       ],
@@ -1606,11 +1606,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.07363306730985641,
+        "cublaslt_best_ms": 0.07418239861726761,
         "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.07363306730985641,
+        "cublaslt_default_ms": 0.07418239861726761,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.07403946916262309
+        "vendor_ms": 0.07424000253280004
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1625,7 +1625,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.07363306730985641,
+      "milliseconds": 0.07418239861726761,
       "profiles": [
         "3v/t200/language.qkv"
       ],
@@ -1636,11 +1636,11 @@
     },
     {
       "candidates": {
-        "cublaslt_best_ms": 0.7824426293373108,
+        "cublaslt_best_ms": 0.7855082750320435,
         "cublaslt_best_rank": 2,
-        "cublaslt_default_ms": 0.8005567789077759,
+        "cublaslt_default_ms": 0.8036300539970398,
         "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.8006538808345794
+        "vendor_ms": 0.803524249792099
       },
       "key": {
         "activation_dtype": "bf16",
@@ -1655,7 +1655,7 @@
         "weight_dtype": "bf16",
         "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 0.7824426293373108,
+      "milliseconds": 0.7855082750320435,
       "profiles": [
         "3v/t200/language.gate_up"
       ],
