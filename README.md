@@ -201,7 +201,7 @@ Supported JSON fields are `max_new_tokens`, `eos_token_id` (scalar or list),
 presence penalties; unrelated Hugging Face fields are ignored.
 
 For Qwen3-VL, add `--image`. The CLI shells out to the Hugging Face processor to
-turn the image into `pixel_values` + `image_grid_thw`, so that Python environment
+turn the image into `pixel_values` + `image_gxgstrid_thw`, so that Python environment
 needs:
 
 ```bash
@@ -231,9 +231,6 @@ cargo run --release --features cuda-no-nvtx -- generate \
 
 `generate` exits non-zero when preprocessing, loading, or generation fails, so it
 is safe to chain in a script.
-
-See the [sampling subsystem documentation](doc/20260819-sampling-subsystem/README.md)
-for the sampling API and backend design.
 
 ## 5. Run PI0.5
 
@@ -452,6 +449,15 @@ subprocess), so activate the environment built in
 ```bash
 source .venv/bin/activate
 ```
+
+`--robot` selects the **embodiment** — the camera wire keys, the state routing,
+and the deployable action width — the way OpenPI's `serve_policy.py
+--policy.config <TrainConfig>` does. It defaults to `franka_libero`; a checkpoint
+fine-tuned for another robot must name its own preset, because a mismatch
+degrades silently rather than failing. `--help` lists every registered preset
+with its slot→key mapping. See
+[Adding an embodiment](doc/adding-an-embodiment.md) for the full launch guide and
+for how to register a new robot.
 
 Start FP8 on port 8000:
 
