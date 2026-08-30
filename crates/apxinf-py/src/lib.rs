@@ -255,7 +255,7 @@ impl Model {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None, num_views=None, sampling_seed=0))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -265,6 +265,8 @@ impl Model {
         tactics: Option<PathBuf>,
         action_horizon: Option<usize>,
         num_views: Option<usize>,
+        num_flow_steps: Option<usize>,
+        flow_start_time: Option<f32>,
         sampling_seed: u64,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
@@ -287,6 +289,14 @@ impl Model {
                 )));
             }
             config.num_views = views;
+            overridden = true;
+        }
+        if let Some(steps) = num_flow_steps {
+            config.num_flow_steps = steps;
+            overridden = true;
+        }
+        if let Some(start_time) = flow_start_time {
+            config.flow_start_time = start_time;
             overridden = true;
         }
         // Validate once, after every override, so a combination that is
@@ -338,6 +348,7 @@ impl Model {
         action_horizon=10,
         action_dim=32,
         num_flow_steps=10,
+        flow_start_time=1.0,
         max_token_len=200,
         calibration=None,
         tactics=None,
@@ -354,6 +365,7 @@ impl Model {
         action_horizon: usize,
         action_dim: usize,
         num_flow_steps: usize,
+        flow_start_time: f32,
         max_token_len: usize,
         calibration: Option<String>,
         tactics: Option<PathBuf>,
@@ -367,6 +379,7 @@ impl Model {
             action_horizon,
             action_dim,
             num_flow_steps,
+            flow_start_time,
             max_token_len,
             ..Pi05Config::default()
         };
@@ -648,6 +661,16 @@ impl Model {
     }
 
     #[getter]
+    fn num_flow_steps(&self) -> usize {
+        self.config.num_flow_steps
+    }
+
+    #[getter]
+    fn flow_start_time(&self) -> f32 {
+        self.config.flow_start_time
+    }
+
+    #[getter]
     fn num_views(&self) -> usize {
         self.config.num_views
     }
@@ -674,10 +697,12 @@ impl Model {
 
     fn __repr__(&self) -> String {
         format!(
-            "Model(device={}, action=[{}, {}], views={}, image={}, patch={})",
+            "Model(device={}, action=[{}, {}], flow_steps={}, flow_start={}, views={}, image={}, patch={})",
             self.device(),
             self.config.action_horizon,
             self.config.action_dim,
+            self.config.num_flow_steps,
+            self.config.flow_start_time,
             self.config.num_views,
             self.config.image_size,
             self.config.patch_size,

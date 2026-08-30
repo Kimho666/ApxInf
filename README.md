@@ -415,6 +415,8 @@ Any registered model type works: `AutoPolicy` dispatches on the checkpoint's
 `config.json`, so the same command benchmarks the next model without a flag
 change.
 
+For one-step evaluation, please refer ApxInf/doc/run_warmstart_with_onstep.md
+
 
 ## NVIDIA build environment
 
