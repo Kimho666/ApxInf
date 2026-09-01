@@ -5,8 +5,8 @@ this repo and the real LIBERO results run on Jetson Orin GPU.
 
 ## Optimization
 
-The warm-start path is implemented in `scripts/eval_libero_warmstart.py` and is
-enabled by one switch:
+The warm-start path is implemented in `scripts/eval_libero.py` and is enabled
+by one switch:
 
 ```bash
 --warm-start
@@ -62,7 +62,7 @@ Runtime partial-flow support:
 
 Warm-start evaluator:
 
-- `scripts/eval_libero_warmstart.py`
+- `scripts/eval_libero.py`
   - adds `--warm-start`
   - adds `--warm-start-alpha`, default `0.5`
   - adds `--flow-start-time`
@@ -91,7 +91,7 @@ Checks run:
 
 ```bash
 .venv/bin/python -m py_compile \
-  scripts/eval_libero_warmstart.py \
+  scripts/eval_libero.py \
   python/apxinf/apxinf/policies/impls/pi05.py
 
 source /home/daigroup/.cargo/env
@@ -113,7 +113,7 @@ env -u CONDA_PREFIX \
   CUDA_HOME=/usr/local/cuda-12.6 \
   APXINF_CUDA_ARCH=sm_87 \
   LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/aarch64-linux/lib:/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-} \
-  .venv/bin/python scripts/eval_libero_warmstart.py \
+  .venv/bin/python scripts/eval_libero.py \
     --backend in-process \
     --model-dir /home/daigroup/projects/ApxInf/.venv/pi05_libero_bf16 \
     --model-type pi05 \
@@ -161,7 +161,7 @@ env -u CONDA_PREFIX \
   CUDA_HOME=/usr/local/cuda-12.6 \
   APXINF_CUDA_ARCH=sm_87 \
   LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/aarch64-linux/lib:/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-} \
-  .venv/bin/python scripts/eval_libero_warmstart.py \
+  .venv/bin/python scripts/eval_libero.py \
     --backend in-process \
     --model-dir /home/daigroup/projects/ApxInf/.venv/pi05_libero_bf16 \
     --model-type pi05 \
