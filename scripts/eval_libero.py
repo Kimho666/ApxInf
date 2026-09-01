@@ -628,7 +628,11 @@ def parse_args() -> argparse.Namespace:
         "--flow-start-time",
         type=float,
         default=None,
-        help="override reverse-flow start time; warm start defaults this to 1-alpha",
+        help=(
+            "override reverse-flow start time; with --warm-start this defaults to "
+            "1-alpha, and without --warm-start values below 1.0 run partial flow "
+            "from pure noise"
+        ),
     )
     in_process.add_argument(
         "--action-horizon",
@@ -649,7 +653,10 @@ def parse_args() -> argparse.Namespace:
         "--warm-start-alpha",
         type=float,
         default=0.5,
-        help="cache/noise blend coefficient; partial flow starts at 1-alpha",
+        help=(
+            "cache/noise blend coefficient used only with --warm-start; partial "
+            "flow starts at 1-alpha"
+        ),
     )
 
     args = parser.parse_args()
@@ -657,6 +664,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--backend in-process requires --model-dir")
     if not (0.0 <= args.warm_start_alpha <= 1.0):
         parser.error("--warm-start-alpha must be in [0, 1]")
+    if args.warm_start and args.warm_start_alpha >= 1.0:
+        parser.error(
+            "--warm-start-alpha must be < 1.0 when --warm-start is enabled "
+            "(otherwise the default flow_start_time would be 0)"
+        )
     if args.warm_start:
         if args.backend != "in-process":
             parser.error("--warm-start requires --backend in-process")
@@ -666,6 +678,13 @@ def parse_args() -> argparse.Namespace:
             args.flow_start_time = 1.0 - args.warm_start_alpha
         if args.flow_start_time <= 0.0 or args.flow_start_time > 1.0:
             parser.error("--flow-start-time must be in (0, 1]")
+    elif args.flow_start_time is not None and args.flow_start_time < 1.0:
+        print(
+            "warning: --flow-start-time < 1.0 without --warm-start runs partial "
+            "flow from pure noise",
+            file=sys.stderr,
+            flush=True,
+        )
     if args.action_horizon is not None:
         # The websocket backend gets its horizon from whatever the server loaded,
         # so accepting the flag here would silently do nothing.
