@@ -162,11 +162,7 @@ impl Model {
         let data = noise.as_slice().map_err(|_| {
             PyValueError::new_err("apxinf_py.infer: noise must be C-contiguous float32")
         })?;
-        Tensor::from_f32(
-            Shape::new(vec![expected[0], expected[1]]),
-            data,
-        )
-        .map_err(runtime_err)
+        Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), data).map_err(runtime_err)
     }
 
     fn action_array<'py>(
@@ -238,7 +234,9 @@ impl Model {
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default) or `cpu`.
     /// * `precision` — `auto` (default), `fp8`, `bf16`, or `int8`.
-    /// * `calibration` / `tactics` — optional FP8 calibration / tactics json.
+    /// * `calibration` — optional FP8 calibration json.
+    /// * `tactics` — optional hardware-wide GEMM tactics json.
+    /// * `autotune` — tune missing exact GEMM keys from the first real request.
     /// * `sampling_seed` — seed for the implicit device-side noise stream used
     ///   when inference is called without `noise`.
     /// * `action_horizon` — override the checkpoint's chunk length. `None`
@@ -255,7 +253,7 @@ impl Model {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -263,6 +261,7 @@ impl Model {
         precision: &str,
         calibration: Option<PathBuf>,
         tactics: Option<PathBuf>,
+        autotune: bool,
         action_horizon: Option<usize>,
         num_views: Option<usize>,
         num_flow_steps: Option<usize>,
@@ -309,6 +308,7 @@ impl Model {
             precision: parse_precision(precision)?,
             calibration_path: calibration,
             tuning_path: tactics,
+            autotune,
             config: overridden.then(|| config.clone()),
             ..LoadOptions::default()
         };
@@ -334,8 +334,8 @@ impl Model {
     /// * `precision` — `bf16` (default), `fp8`, or `int8`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
-    /// * `tactics` — optional FP8 tactics json (a synthetic FP8 run falls back to
-    ///   the kernel's default tactic when omitted).
+    /// * `tactics` — optional hardware-wide GEMM tactics json.
+    /// * `autotune` — tune missing exact GEMM keys from the first real request.
     /// * `seed` — RNG seed for reproducible weights.
     /// * `sampling_seed` — independent seed for implicit device-side noise.
     #[staticmethod]
@@ -352,6 +352,7 @@ impl Model {
         max_token_len=200,
         calibration=None,
         tactics=None,
+        autotune=false,
         seed=0,
         sampling_seed=0,
     ))]
@@ -369,6 +370,7 @@ impl Model {
         max_token_len: usize,
         calibration: Option<String>,
         tactics: Option<PathBuf>,
+        autotune: bool,
         seed: u64,
         sampling_seed: u64,
     ) -> PyResult<Self> {
@@ -404,13 +406,13 @@ impl Model {
             text_weight_dtype: None,
             calibration_path,
             tuning_path: tactics,
+            autotune,
             config: Some(config.clone()),
             synthetic: Some(SyntheticWeights { seed }),
             uniform_fp8_scale,
             ..LoadOptions::default()
         };
-        let loaded = AutoModel::load_model(device, Path::new(""), &options)
-            .map_err(runtime_err)?;
+        let loaded = AutoModel::load_model(device, Path::new(""), &options).map_err(runtime_err)?;
         Ok(Self {
             model: loaded,
             config,
@@ -452,16 +454,15 @@ impl Model {
         let tokens = token_ids
             .as_slice()
             .map_err(|_| {
-                PyValueError::new_err("apxinf_py._infer_patches: token_ids must be C-contiguous uint32")
+                PyValueError::new_err(
+                    "apxinf_py._infer_patches: token_ids must be C-contiguous uint32",
+                )
             })?
             .to_vec();
         self.validate_tokens(&tokens)?;
 
-        let patch_tensor = Tensor::from_f32(
-            Shape::new(vec![expected[0], expected[1]]),
-            patch_data,
-        )
-        .map_err(runtime_err)?;
+        let patch_tensor = Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), patch_data)
+            .map_err(runtime_err)?;
 
         let observation = Observation {
             vision: VisionObservation::Patches(patch_tensor),
@@ -510,11 +511,8 @@ impl Model {
             })?
             .to_vec();
         self.validate_tokens(&tokens)?;
-        let patch_tensor = Tensor::from_f32(
-            Shape::new(vec![expected[0], expected[1]]),
-            patch_data,
-        )
-        .map_err(runtime_err)?;
+        let patch_tensor = Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), patch_data)
+            .map_err(runtime_err)?;
         let observation = Observation {
             vision: VisionObservation::Patches(patch_tensor),
             token_ids: tokens,
