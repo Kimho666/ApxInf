@@ -744,6 +744,17 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn apxinf_static_bias_position_f32_bf16(
+        projection: *const c_void,
+        bias: *const c_void,
+        position: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        tokens_per_view: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_rms_norm_f32(
         input: *const c_void,
         weight: *const c_void,
