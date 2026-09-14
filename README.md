@@ -1,6 +1,8 @@
-# ApxInf
+<div align="center">
+  <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/logo.png" alt="apxinf-logo" width="512"/>
+</div>
 
-## Description
+# ApxInf
 
 ApxInf is a reimagined edge inference engine born of the agentic coding era,
 combining high performance, reliability, and energy efficiency across devices
@@ -94,6 +96,15 @@ steady-state CUDA Graph replay P50.
 | Jetson AGX Orin | BF16 | 165.67 ms | 6.0 Hz |
 | RTX 4090 | BF16 | 31.38 ms | 31.9 Hz |
 | RTX 4090 | INT8 | 25.99 ms | 38.5 Hz |
+
+With onestep action generation pruning.
+
+| Hardware | Precision | Latency | Throughput |
+|---|---|---:|---:|
+| Jetson AGX Thor | BF16 | 44.05 ms | 22.7 Hz |
+| Jetson AGX Thor | FP8 | 26.32 ms | 38.0 Hz |
+| Jetson AGX Orin | BF16 | 119.05 ms | 8.4 Hz |
+| RTX 4090 | BF16 | 20.36 ms | 49.1 Hz |
 
 LIBERO-10, 10 tasks x 50 episodes, `H=10`, `replan=5`, seed 7. PI0.5 reference
 is 92.4%.
@@ -504,3 +515,14 @@ Built with Rust 1.95 and 1.96; no minimum supported version is declared.
 ## License
 
 Apache 2.0. Vendored third-party components retain their own licenses.
+
+
+## Community
+
+
+Scan the QR Code to join our Wechat Group
+
+<div align="left">
+  <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/wechat.jpg" alt="wechat-group" width="256"/>
+</div>
+
