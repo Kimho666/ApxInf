@@ -20,6 +20,7 @@ from apxinf.processors.tokenize import discretize_state
 from apxinf.policies.impls.pi0fast import (
     Pi0FastPolicy,
     _hf_cache_matches,
+    _orthonormal_idct,
     detokenize_action_tokens,
 )
 
@@ -292,7 +293,7 @@ def test_hf_cache_lookup_is_newest_first(tmp_path, monkeypatch):
 
 
 def test_from_pretrained_loads_a_checkpoint_directory(tmp_path, monkeypatch):
-    pytest.importorskip("tokenizers")
+    pytest.importorskip("apxinf_py")
     monkeypatch.setenv("HF_HOME", str(tmp_path))
     model_dir = _write_checkpoint(tmp_path)
     coefficients = (np.arange(70) - 30).astype(np.float64)
@@ -321,9 +322,42 @@ def test_from_pretrained_loads_a_checkpoint_directory(tmp_path, monkeypatch):
 
 
 def _idct(coefficients):
-    from scipy.fft import idct
+    """The policy's action decode, in the two steps the test can spell out.
 
-    return idct(coefficients / 10.0, axis=0, norm="ortho")
+    First the token grid the stream carried is divided by ``_StubFast.scale`` —
+    the same step :func:`detokenize_action_tokens` applies to what the BPE gave
+    back. Then the orthonormal inverse DCT-II is summed straight from its
+    definition, ``x[n] = X[0]/sqrt(N) + sqrt(2/N) * sum_{k>=1} X[k] cos(pi*k*(2n+1)
+    / (2N))``: the DC weight, the harmonic axis and the cosine argument are all
+    written out, so this shares no arithmetic with the policy's transposed-matrix
+    product and cannot inherit its mistakes.
+    """
+    coefficients = np.asarray(coefficients, dtype=np.float64) / _StubFast.scale
+    rows = coefficients.shape[0]
+    sample = np.arange(rows, dtype=np.float64)[:, None]
+    out = coefficients[0] / np.sqrt(rows)
+    for harmonic in range(1, rows):
+        angle = np.pi * harmonic * (2.0 * sample + 1.0) / (2.0 * rows)
+        out = out + np.sqrt(2.0 / rows) * np.cos(angle) * coefficients[harmonic]
+    return out
+
+
+def test_orthonormal_idct_matches_the_definition_one_harmonic_at_a_time():
+    """A lone coefficient ``k`` must map to ``g_k cos(pi k (2n+1) / 2N)``.
+
+    ``g_0 = sqrt(1/N)``, ``g_k = sqrt(2/N)`` for ``k >= 1``. Probing one harmonic
+    at a time is what pins the DC convention: the ``k = 0`` factor belongs to the
+    *coefficient* index, and scaling the first output sample instead is a mistake
+    that a sum-of-all-harmonics test would hide.
+    """
+    rows = 10
+    sample = np.arange(rows, dtype=np.float64)[:, None]
+    for harmonic in range(rows):
+        coefficients = np.zeros((rows, 1), dtype=np.float64)
+        coefficients[harmonic] = 1.0
+        scale = np.sqrt(1.0 / rows) if harmonic == 0 else np.sqrt(2.0 / rows)
+        expected = scale * np.cos(np.pi * harmonic * (2.0 * sample + 1.0) / (2.0 * rows))
+        np.testing.assert_allclose(_orthonormal_idct(coefficients), expected, atol=1e-12)
 
 
 def _paligemma_vocab():

@@ -18,14 +18,14 @@ from the *cleaned* task text and the checkpoint-normalized state, padded to
 PaliGemma BOS is prepended by the tokenizer and appended again after the prompt
 by the runtime, so the prefix is ``[images, language, BOS]`` as in the reference.
 
-**No torch, no transformers.** Both tokenizers are loaded through ``tokenizers``
-— the engine behind HF's fast tokenizers — straight from the assets the
+**No torch, no transformers, no tokenizers wheel.** Both tokenizers load through
+the native binding (``apxinf_py.HfTokenizer``) straight from the assets the
 checkpoint names: PaliGemma (``google/paligemma-3b-pt-224`` by default) for the
 prompt and the action id space, and the FAST action tokenizer
-(``action_tokenizer_name``) for the BPE detokenization. The normalization
-statistics are read out of the checkpoint's ``policy_*_processor_*.safetensors``
-state files. That keeps this policy loadable in the same numpy/scipy
-environment as PI0.5, with no model-side torch anywhere on the path.
+(``action_tokenizer_name``) for the BPE detokenization. The inverse DCT is a
+numpy basis multiply and the normalization statistics are read out of the
+checkpoint's ``policy_*_processor_*.safetensors`` state files, so this policy
+runs on numpy plus the ApxInf binding — no torch, no scipy, no HF wheel.
 
 **State is required, not optional.** π0-FAST conditions on proprioception
 through the prompt text, so there is no "drop state" variant: the wire state
@@ -49,7 +49,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
-from ...processors import ImageStack, ParseImage, Pipeline, TorchResizeWithPad
+from ...processors import ImageStack, ParseImage, Pipeline, ResizeWithPadNoAntialias
 from ...processors.tokenize import discretize_state
 from ...processors.transforms import OBSERVATION, PROMPT, RGB, lookup_key
 from ..base import VIEW_SLOTS
@@ -189,6 +189,22 @@ def _preprocessor_tokenizer_names(model_dir: pathlib.Path) -> dict:
 # --- tokenizers ---------------------------------------------------------------
 
 
+def _base_vocab_size(tokenizer_json: pathlib.Path) -> int:
+    """The tokenizer's base vocabulary, as HF's ``PreTrainedTokenizerFast.vocab_size``.
+
+    The action-id offset is defined against the *base* vocabulary, not against
+    the added-token-inclusive count the native binding's ``vocab_size`` reports:
+    for PaliGemma the two differ by exactly one, because ``<image>`` is an added
+    token sitting right past the base vocabulary, and an off-by-one there shifts
+    every action id in the stream. The count is therefore read from the asset
+    itself, where it is a plain property of the vocabulary the checkpoint was
+    trained with — ``model.vocab`` for BPE and WordLevel, ``model.tokens`` for
+    Unigram (PaliGemma's is BPE).
+    """
+    model = json.loads(pathlib.Path(tokenizer_json).read_text())["model"]
+    return len(model["vocab"] if "vocab" in model else model["tokens"])
+
+
 class _PaligemmaTokenizer:
     """PaliGemma as a plain id map: prompt ids in, action id space out.
 
@@ -201,15 +217,11 @@ class _PaligemmaTokenizer:
     """
 
     def __init__(self, tokenizer_json: pathlib.Path, *, max_length: int):
-        from tokenizers import Tokenizer  # lazy: keeps the module import offline
+        import apxinf_py  # lazy: the processor library imports without the binding
 
-        self._backend = Tokenizer.from_file(str(tokenizer_json))
+        self._backend = apxinf_py.HfTokenizer.from_file(str(tokenizer_json))
         self.max_length = int(max_length)
-        # HF's ``PreTrainedTokenizerFast.vocab_size`` — the base vocabulary the
-        # action-id offset is computed against, *not* ``tokenizers``' own
-        # added-token-inclusive count (PaliGemma carries ``<image>`` at 257152, so
-        # the two differ by exactly that one PaliGemma-only token).
-        self.vocab_size = int(self._backend.get_vocab_size(with_added_tokens=False))
+        self.vocab_size = _base_vocab_size(tokenizer_json)
         self.bos_token_id = self._require("<bos>")
         self.pipe_token_id = self._require("|")
         self.action_prefix_ids = self.encode("Action: ")
@@ -226,7 +238,7 @@ class _PaligemmaTokenizer:
 
     def encode(self, text: str) -> list:
         """Ids for ``text`` with no special tokens — the prompt's raw tokens."""
-        return list(self._backend.encode(text, add_special_tokens=False).ids)
+        return list(self._backend.encode(text))
 
     def prompt_ids(self, text: str) -> list:
         """``[BOS] + text + [BOS]``, the sequence the runtime embeds.
@@ -253,15 +265,42 @@ class _FastActionTokenizer:
     """The FAST BPE detokenizer, from the checkpoint's ``action_tokenizer_name``."""
 
     def __init__(self, root: pathlib.Path):
-        from tokenizers import Tokenizer
+        import apxinf_py
 
-        self._backend = Tokenizer.from_file(str(root / "tokenizer.json"))
+        self._backend = apxinf_py.HfTokenizer.from_file(str(root / "tokenizer.json"))
         config = json.loads((root / "processor_config.json").read_text())
         self.min_token = int(config["min_token"])
         self.scale = float(config["scale"])
 
     def decode(self, token_ids: Sequence[int]) -> str:
         return self._backend.decode(list(token_ids))
+
+
+_DCT_BASIS: dict = {}
+
+
+def _orthonormal_idct(coefficients: np.ndarray) -> np.ndarray:
+    """``scipy.fft.idct(x, axis=0, norm="ortho")``, as a numpy basis multiply.
+
+    The coefficients arrive as an ``action_horizon``-row block, so the basis is
+    small and squared away once per horizon. It is the transposed orthonormal
+    DCT-II matrix — ``sqrt(2/N) * cos(pi*(2n+1)*k/(2N))``, with the ``k = 0``
+    column carrying the extra ``1/sqrt(2)`` — so one product inverts the
+    transform. The product is accumulated in float64; the policy tests check it
+    against the same definition summed term by term.
+    """
+    coefficients = np.asarray(coefficients, dtype=np.float64)
+    rows = coefficients.shape[0]
+    basis = _DCT_BASIS.get(rows)
+    if basis is None:
+        index = np.arange(rows, dtype=np.float64)
+        basis = np.cos(np.pi * (2.0 * index[:, None] + 1.0) * index[None, :] / (2.0 * rows))
+        basis *= np.sqrt(2.0 / rows)
+        # The DC weight belongs to the *coefficient* index, i.e. column 0 — the
+        # row it would otherwise scale is the first sample of the action chunk.
+        basis[:, 0] *= np.sqrt(0.5)
+        _DCT_BASIS[rows] = basis
+    return basis @ coefficients
 
 
 def detokenize_action_tokens(
@@ -308,9 +347,7 @@ def detokenize_action_tokens(
         coefficients = coefficients[:expected]
     coefficients = coefficients.reshape(int(action_horizon), int(action_dim))
 
-    from scipy.fft import idct  # lazy: only a detokenizing policy needs scipy
-
-    return idct(coefficients / fast_tokenizer.scale, axis=0, norm="ortho")
+    return _orthonormal_idct(coefficients / fast_tokenizer.scale)
 
 
 def _default_image_keys(num_views: int) -> tuple:
@@ -576,12 +613,19 @@ class Pi0FastPolicy:
             ).parent
         )
 
-        # LeRobot resizes with `resize_with_pad_torch` (torch bilinear,
-        # align_corners=False), not with PIL; the two disagree by up to ~21/255 on
-        # LIBERO's 256->224 downscale, which is enough to change the emitted FAST
-        # tokens. Match the reference interpolator, not PI0.5's.
+        # LeRobot resizes with `resize_with_pad_torch` (two-tap bilinear,
+        # align_corners=False, no antialiasing), not with PIL; the two disagree by
+        # up to ~21/255 on LIBERO's 256->224 downscale, which is enough to change
+        # the emitted FAST tokens. Match the reference interpolator, not PI0.5's.
+        # A checkpoint OpenPI trained itself is a different reference again - its
+        # JAX models resize with `jax.image.resize(..., LINEAR)`, which antialiases
+        # like PIL - so a caller loading one passes `image_pipeline=` explicitly
+        # rather than having it guessed from the weights.
         image_pipeline = image_pipeline or Pipeline(
-            [("parse", ParseImage()), ("resize", TorchResizeWithPad(int(model.image_size)))]
+            [
+                ("parse", ParseImage()),
+                ("resize", ResizeWithPadNoAntialias(int(model.image_size))),
+            ]
         )
         return cls(
             model,

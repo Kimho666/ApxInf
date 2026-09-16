@@ -437,7 +437,9 @@ read from the assets the checkpoint names (`text_tokenizer_name`,
 ### Run
 
 ```bash
-pip install -e "python/apxinf[pi0fast]"
+# the native binding then the frontend, as in "Build ApxInf" - no extra of its own
+pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
+pip install -e python/apxinf
 huggingface-cli download lerobot/pi0fast-libero-v044 --local-dir <path-to-model>
 
 python scripts/eval_libero.py --backend in-process --model-dir <path-to-model> \

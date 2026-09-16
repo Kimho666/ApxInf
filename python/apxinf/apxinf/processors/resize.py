@@ -7,14 +7,27 @@ letterbox-resized (BILINEAR, aspect-preserving) onto a zero-padded square
 canvas. Splitting parse and resize into two steps lets a caller swap either one
 independently while chaining them in a :class:`~apxinf.processors.Pipeline`.
 
-There are two letterbox resizes because the reference model families do not
-share one. :class:`ResizeWithPad` is the PIL/BILINEAR one above, which is what
-PI0.5's OpenPI-derived pipeline uses. :class:`TorchResizeWithPad` reproduces
-``F.interpolate(mode="bilinear", align_corners=False)`` — the numerics of
-LeRobot's ``resize_with_pad_torch``, which is what π0-FAST's checkpoint was
-trained and evaluated with. They are *not* interchangeable: the two
-interpolators disagree by up to ~21/255 on a 256→224 downscale, and that is
-enough to change which FAST action tokens the model emits.
+There are two letterbox resizes because the references do not share one, and the
+choice is not cosmetic: on a 256→224 downscale the two kernels disagree by up
+to ~52/255 on random content (~21/255 on LIBERO's frames), which is enough to
+change which FAST action tokens π0-FAST emits.
+
+:class:`ResizeWithPad` is the PIL/BILINEAR one above. PIL widens its filter on
+downscale (antialiasing), and this is the kernel OpenPI's examples preprocess
+with — ``openpi_client.image_tools.resize_with_pad`` is PIL ``BILINEAR`` — as
+well as what PI0.5's OpenPI-derived pipeline uses.
+
+:class:`ResizeWithPadNoAntialias` is the two-tap half-pixel kernel. It transcribes
+``F.interpolate(mode="bilinear", align_corners=False)``, i.e.
+``resize_with_pad_torch`` as LeRobot and ``openpi.shared.image_tools`` both spell
+it, does not widen on downscale, and is what the ``lerobot/pi0fast-*``
+checkpoints were trained and evaluated with, so it is the default for π0-FAST.
+
+A π0-FAST checkpoint that OpenPI itself trained may follow a third path: OpenPI's
+JAX models resize server-side with ``jax.image.resize(..., LINEAR)``, which does
+antialias. Nothing here can infer that, so matching the pipeline a checkpoint was
+trained with stays the caller's choice — both are ordinary steps, and
+``Pi0FastPolicy`` takes the whole list through ``image_pipeline=``.
 """
 
 from __future__ import annotations
@@ -24,7 +37,7 @@ from PIL import Image
 
 from .base import ProcessorStep
 
-__all__ = ["ParseImage", "ResizeWithPad", "TorchResizeWithPad"]
+__all__ = ["ParseImage", "ResizeWithPad", "ResizeWithPadNoAntialias"]
 
 
 class ParseImage(ProcessorStep):
@@ -85,13 +98,14 @@ class ResizeWithPad(ProcessorStep):
         return np.asarray(canvas)
 
 
-def _torch_interpolate_taps(in_length: int, out_length: int):
-    """Source taps and weights for ``F.interpolate(..., align_corners=False)``.
+def _bilinear_taps(in_length: int, out_length: int):
+    """Source taps and weights for the half-pixel two-tap bilinear mapping.
 
-    PyTorch maps output index ``dst`` to ``scale*(dst + 0.5) - 0.5`` with
-    ``scale = in/out``, clamps negatives to zero, and linearly blends the two
-    neighbouring source samples. This transcribes that mapping so the resize
-    below can be reproduced without a torch dependency.
+    Output index ``dst`` maps to ``scale*(dst + 0.5) - 0.5`` with
+    ``scale = in/out``, negatives clamp to zero, and the two neighbouring source
+    samples are blended linearly — the ``align_corners=False`` convention.
+    Transcribing the mapping is what lets the resize below reproduce it without
+    a torch dependency.
     """
     scale = np.float32(in_length / out_length)
     destination = np.arange(out_length, dtype=np.float32)
@@ -103,16 +117,16 @@ def _torch_interpolate_taps(in_length: int, out_length: int):
     return low, high, (source - low.astype(np.float32)).astype(np.float32)
 
 
-def _torch_bilinear_resize(image: np.ndarray, height: int, width: int) -> np.ndarray:
-    """Bilinear resize of a ``float32`` HWC image, matching ``F.interpolate``.
+def _bilinear_resize_no_antialias(image: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Two-tap bilinear resize of a ``float32`` HWC image, without antialiasing.
 
-    The four-corner blend is written the way PyTorch accumulates it
+    The four-corner blend is written the way the reference kernel accumulates it
     (`h0 * (w0*v00 + w1*v01) + h1 * (w0*v10 + w1*v11)`) rather than as a
     separable two-pass filter, so the float rounding matches too.
     """
     image = np.asarray(image, dtype=np.float32)
-    rows_low, rows_high, rows_frac = _torch_interpolate_taps(image.shape[0], height)
-    cols_low, cols_high, cols_frac = _torch_interpolate_taps(image.shape[1], width)
+    rows_low, rows_high, rows_frac = _bilinear_taps(image.shape[0], height)
+    cols_low, cols_high, cols_frac = _bilinear_taps(image.shape[1], width)
     horizontal = cols_frac[None, :, None]
     vertical = rows_frac[:, None, None]
     top = (
@@ -126,17 +140,18 @@ def _torch_bilinear_resize(image: np.ndarray, height: int, width: int) -> np.nda
     return top * (np.float32(1.0) - vertical) + bottom * vertical
 
 
-class TorchResizeWithPad(ProcessorStep):
-    """Letterbox-resize a ``uint8`` HWC image the way LeRobot does.
+class ResizeWithPadNoAntialias(ProcessorStep):
+    """Letterbox-resize a ``uint8`` HWC image with a two-tap half-pixel kernel.
 
     Same geometry as :class:`ResizeWithPad` — scale the longer side to ``size``
-    and center the result on a zero canvas — but the interpolation is
-    ``F.interpolate(mode="bilinear", align_corners=False)``, which is what
-    ``lerobot.policies.pi0_fast.modeling_pi0_fast.resize_with_pad_torch`` calls
-    (and what the π0-FAST checkpoint saw during training). The result is rounded
-    back to ``uint8`` because the runtime's image entry point takes ``uint8``;
-    that round-trip reproduces the reference's tokens exactly, while PIL's
-    BILINEAR does not.
+    and center the result on a zero canvas — but no antialiasing filter: each
+    output pixel blends its two neighbours the way
+    ``F.interpolate(mode="bilinear", align_corners=False)`` maps them, which is
+    the kernel LeRobot's ``resize_with_pad_torch`` uses and what the π0-FAST
+    checkpoint saw during training. Only the arithmetic is transcribed, so this
+    needs no torch. The result is rounded back to ``uint8`` because the
+    runtime's image entry point takes ``uint8``; that round-trip reproduces the
+    reference's tokens exactly, while PIL's BILINEAR does not.
     """
 
     PARAMS = ("size",)
@@ -153,7 +168,7 @@ class TorchResizeWithPad(ProcessorStep):
         ratio = max(current_width / size, current_height / size)
         resized_height = int(current_height / ratio)
         resized_width = int(current_width / ratio)
-        resized = _torch_bilinear_resize(
+        resized = _bilinear_resize_no_antialias(
             image.astype(np.float32) / np.float32(255.0), resized_height, resized_width
         )
         resized = np.clip(np.round(resized * np.float32(255.0)), 0.0, 255.0).astype(np.uint8)

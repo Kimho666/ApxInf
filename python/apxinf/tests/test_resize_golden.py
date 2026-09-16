@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from apxinf.processors import ParseImage, ResizeWithPad, TorchResizeWithPad
+from apxinf.processors import ParseImage, ResizeWithPad, ResizeWithPadNoAntialias
 
 IMAGE_SIZE = 224
 
@@ -76,10 +76,12 @@ def test_parse_rejects_bad_rank():
         ParseImage()(np.zeros((224, 224), dtype=np.uint8))
 
 
-def ref_torch_bilinear_resize(image: np.ndarray, height: int, width: int) -> np.ndarray:
-    """Transcription of ``torch.nn.functional.interpolate(align_corners=False)``.
+def ref_bilinear_resize_no_antialias(
+    image: np.ndarray, height: int, width: int
+) -> np.ndarray:
+    """Transcription of the two-tap ``interpolate(align_corners=False)`` kernel.
 
-    Written as PyTorch's own kernel accumulates it — a four-corner blend in
+    Written as the reference kernel accumulates it — a four-corner blend in
     ``float32`` — so the apxinf step can be anchored without importing torch.
     """
 
@@ -111,14 +113,14 @@ def ref_torch_bilinear_resize(image: np.ndarray, height: int, width: int) -> np.
     return np.clip(np.round(out * np.float32(255.0)), 0.0, 255.0).astype(np.uint8)
 
 
-def ref_torch_resize_with_pad(image: np.ndarray, size: int) -> np.ndarray:
+def ref_no_antialias_resize_with_pad(image: np.ndarray, size: int) -> np.ndarray:
     if image.shape[:2] == (size, size):
         return image
     current_height, current_width = image.shape[:2]
     ratio = max(current_width / size, current_height / size)
     resized_height = int(current_height / ratio)
     resized_width = int(current_width / ratio)
-    resized = ref_torch_bilinear_resize(image, resized_height, resized_width)
+    resized = ref_bilinear_resize_no_antialias(image, resized_height, resized_width)
     canvas = np.zeros((size, size, 3), dtype=np.uint8)
     pad_height, _ = divmod(size - resized_height, 2)
     pad_width, _ = divmod(size - resized_width, 2)
@@ -127,19 +129,19 @@ def ref_torch_resize_with_pad(image: np.ndarray, size: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize("shape", [(224, 224, 3), (256, 256, 3), (256, 320, 3), (100, 50, 3)])
-def test_torch_resize_matches_reference(shape):
+def test_no_antialias_resize_matches_reference(shape):
     rng = np.random.default_rng(7)
     image = rng.integers(0, 256, size=shape, dtype=np.uint8)
-    got = TorchResizeWithPad(IMAGE_SIZE)(ParseImage()(image))
-    want = ref_torch_resize_with_pad(ref_parse_image(image), IMAGE_SIZE)
+    got = ResizeWithPadNoAntialias(IMAGE_SIZE)(ParseImage()(image))
+    want = ref_no_antialias_resize_with_pad(ref_parse_image(image), IMAGE_SIZE)
     assert got.shape == (IMAGE_SIZE, IMAGE_SIZE, 3)
     np.testing.assert_array_equal(got, want)
 
 
-def test_torch_resize_differs_from_pil_resize():
+def test_no_antialias_resize_differs_from_pil_resize():
     """The two interpolators are not interchangeable — that is why both exist."""
     rng = np.random.default_rng(11)
     image = rng.integers(0, 256, size=(256, 256, 3), dtype=np.uint8)
-    torch_style = TorchResizeWithPad(IMAGE_SIZE)(image)
+    two_tap_style = ResizeWithPadNoAntialias(IMAGE_SIZE)(image)
     pil_style = ResizeWithPad(IMAGE_SIZE)(image)
-    assert not np.array_equal(torch_style, pil_style)
+    assert not np.array_equal(two_tap_style, pil_style)
