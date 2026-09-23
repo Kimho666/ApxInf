@@ -25,6 +25,7 @@
 //! The VLA runtimes are only registered on CUDA devices, so real inference
 //! requires the `cuda` feature and a CUDA machine; without it the module still
 //! imports and reports shape contracts, but model loading errors.
+//!
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -190,7 +191,7 @@ struct PreprocessedVlaInput {
     latent: Tensor,
     attention_mask: Vec<u8>,
     image_grid_thw: Vec<[u32; 3]>,
-    embodiment_id: usize,
+    embodiment_id: Option<usize>,
 }
 
 impl ModelRunner {
@@ -311,7 +312,7 @@ impl ModelRunner {
         token_ids: PyReadonlyArray1<'py, u32>,
         attention_mask: PyReadonlyArray1<'py, u8>,
         state: PyReadonlyArrayDyn<'py, f32>,
-        embodiment_id: usize,
+        embodiment_id: Option<usize>,
         noise: PyReadonlyArrayDyn<'py, f32>,
     ) -> PyResult<PreprocessedVlaInput> {
         let pixels_shape = pixel_values.shape();
@@ -455,19 +456,19 @@ impl ModelRunner {
     /// * `autotune` — tune missing exact GEMM keys from the first real request.
     /// * `sampling_seed` — seed for the implicit device-side noise stream used
     ///   when inference is called without `noise`.
-    /// * `config_json` — optional `config.json`-shaped architecture JSON.
+    /// * `config_json` - optional `config.json`-shaped architecture JSON.
     ///   `None` delegates config loading to AutoModel.
-    /// * `action_horizon` — override the checkpoint's chunk length. `None`
+    /// * `action_horizon` - override the checkpoint's chunk length. `None`
     ///   (default) runs the native `config.json` value; an explicit value wins
     ///   over it. The horizon is a sequence length, not a weight dimension, so
     ///   the same weights load and run at the requested chunk length.
-    /// * `num_views` — serve fewer cameras than the checkpoint declares.
+    /// * `num_views` - serve fewer cameras than the checkpoint declares.
     ///
     /// `num_views` exists because a deployment often has fewer cameras than the
     /// checkpoint was trained with. Dropping the trailing views is numerically
-    /// equivalent to openpi zero-padding and masking them — a masked view is
-    /// excluded from attention and consumes no RoPE position, and the vision
-    /// tower has no per-slot parameters — while saving one view's worth of patch
+    /// equivalent to openpi zero-padding and masking them - a masked view is
+    /// excluded from attention, consumes no RoPE position, and the vision
+    /// tower has no per-slot parameters - while saving one view's worth of patch
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
@@ -563,10 +564,10 @@ impl ModelRunner {
     /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
-    /// * `tactics` — optional hardware-wide GEMM tactics json.
-    /// * `autotune` — tune missing exact GEMM keys from the first real request.
-    /// * `seed` — RNG seed for reproducible weights.
-    /// * `sampling_seed` — independent seed for implicit device-side noise.
+    /// * `tactics` - optional hardware-wide GEMM tactics json.
+    /// * `autotune` - tune missing exact GEMM keys from the first real request.
+    /// * `seed` - RNG seed for reproducible weights.
+    /// * `sampling_seed` - independent seed for implicit device-side noise.
     #[staticmethod]
     #[pyo3(signature = (
         model,
@@ -655,13 +656,13 @@ impl ModelRunner {
         })
     }
 
-    /// **L0** (internal, not public API) — infer from pre-computed patches. No
+    /// **L0** (internal, not public API) - infer from pre-computed patches. No
     /// processor is applied. Exposed to Python as the private `_infer_patches`
     /// for L0/L1 consistency tests only; may change or be removed without notice.
     ///
-    /// * `patches` — `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
-    /// * `token_ids` — `uint32` `[token_count]` (1..=max_token_len).
-    /// * `noise` — optional `float32` `[action_horizon, action_dim]`; omission
+    /// * `patches` - `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
+    /// * `token_ids` - `uint32` `[token_count]` (1..=max_token_len).
+    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
     ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
@@ -726,6 +727,8 @@ impl ModelRunner {
         state,
         embodiment_id,
         noise,
+        *, num_steps=None, max_new_tokens=None, min_new_tokens=0,
+        terminator_ids=None, closing_ids=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn infer_preprocessed<'py>(
@@ -736,8 +739,13 @@ impl ModelRunner {
         token_ids: PyReadonlyArray1<'py, u32>,
         attention_mask: PyReadonlyArray1<'py, u8>,
         state: PyReadonlyArrayDyn<'py, f32>,
-        embodiment_id: usize,
+        embodiment_id: Option<usize>,
         noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let input = self.preprocessed_vla_input(
             "_infer_preprocessed",
@@ -749,10 +757,35 @@ impl ModelRunner {
             embodiment_id,
             noise,
         )?;
+        use apxinf_model::vla::{PlanningOptions, ReasoningOptions};
+        let reasoning = match max_new_tokens {
+            Some(max_new_tokens) => Some(ReasoningOptions {
+                max_new_tokens,
+                min_new_tokens,
+                terminator_ids: terminator_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires terminator_ids"))?,
+                closing_ids: closing_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires closing_ids"))?,
+            }),
+            None => {
+                if min_new_tokens != 0 || terminator_ids.is_some() || closing_ids.is_some() {
+                    return Err(PyValueError::new_err(
+                        "reasoning options require max_new_tokens",
+                    ));
+                }
+                None
+            }
+        };
+        let options = PlanningOptions {
+            num_steps,
+            reasoning,
+        };
         let metadata = VlaMetadata {
             attention_mask: Some(&input.attention_mask),
             image_grid_thw: Some(&input.image_grid_thw),
-            embodiment_id: Some(input.embodiment_id),
+            embodiment_id: input.embodiment_id,
+            planning: (options.num_steps.is_some() || options.reasoning.is_some())
+                .then_some(&options),
         };
         let request =
             VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
@@ -790,13 +823,14 @@ impl ModelRunner {
             token_ids,
             attention_mask,
             state,
-            embodiment_id,
+            Some(embodiment_id),
             noise,
         )?;
         let metadata = VlaMetadata {
             attention_mask: Some(&input.attention_mask),
             image_grid_thw: Some(&input.image_grid_thw),
-            embodiment_id: Some(input.embodiment_id),
+            embodiment_id: input.embodiment_id,
+            planning: None,
         };
         self.model
             .calibration_amax(&VlaRequest::provided_with_metadata(
@@ -852,14 +886,14 @@ impl ModelRunner {
         self.run_generated(py, observation, RngKey::new(seed, sequence, draw))
     }
 
-    /// **L1** — infer from resized RGB `uint8` images; vision→patches runs in the
+    /// **L1** - infer from resized RGB `uint8` images; vision->patches runs in the
     /// Rust CUDA graph.
     ///
-    /// * `rgb_u8` — `uint8` images, `num_views * image_size * image_size * 3`
+    /// * `rgb_u8` - `uint8` images, `num_views * image_size * image_size * 3`
     ///   bytes total, in `layout` order.
-    /// * `layout` — `"nhwc"` or `"nchw"`.
-    /// * `token_ids` — `uint32` `[token_count]`.
-    /// * `noise` — optional `float32` `[action_horizon, action_dim]`; omission
+    /// * `layout` - `"nhwc"` or `"nchw"`.
+    /// * `token_ids` - `uint32` `[token_count]`.
+    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
     ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
@@ -1000,7 +1034,10 @@ impl ModelRunner {
                 token_shape[1]
             )));
         }
-        let ids = values.into_iter().map(|value| value as u32).collect::<Vec<u32>>();
+        let ids = values
+            .into_iter()
+            .map(|value| value as u32)
+            .collect::<Vec<u32>>();
         Ok(Array1::from_vec(ids).into_pyarray_bound(py))
     }
 
@@ -1053,6 +1090,70 @@ impl ModelRunner {
     #[pyo3(name = "_calibration_plan")]
     fn calibration_plan(&self) -> PyResult<Vec<String>> {
         self.model.calibration_plan().map_err(runtime_err)
+    }
+
+    /// Internal native-BF16 activation probe used by ``scripts/calibrate_pi0fast.py``.
+    ///
+    /// π0-FAST has no latent to seed: the decode is a deterministic greedy
+    /// argmax, so the same Observation always produces the same activations.
+    /// ``stop_token`` ends the capture where inference would: a profile is only
+    /// valid for the activations deployment quantizes, and free-running past the
+    /// terminator records decode steps no rollout ever reaches.
+    #[pyo3(name = "_calibrate_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    fn calibrate_tokens_rgb(
+        &self,
+        rgb_u8: PyReadonlyArrayDyn<'_, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        stop_token: Option<u32>,
+    ) -> PyResult<BTreeMap<String, f32>> {
+        self.action_tokens.ok_or_else(|| {
+            PyValueError::new_err(
+                "apxinf_py._calibrate_tokens_rgb: loaded model does not produce \
+                 discrete action tokens (it is a continuous-action runtime)",
+            )
+        })?;
+        let contract = self.require_rgb_contract("_calibrate_tokens_rgb")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_tokens_rgb: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py._calibrate_tokens_rgb: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_tokens_rgb: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: None,
+        };
+        let unused_latent = Tensor::zeros(Shape::new(vec![1, 1]), DType::F32);
+        let request = VlaRequest::provided(&observation, &unused_latent);
+        self.model
+            .calibration_amax_stop(&request, stop_token)
+            .map_err(runtime_err)
     }
 
     /// Seeded L1 inference. This avoids creating or transferring a host noise

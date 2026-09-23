@@ -17,6 +17,7 @@ pub fn register_builtin_models() {
     registry::register("llama", load_llama);
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
+    registry::register("qwen_drive", load_qwen_drive);
 
     #[cfg(feature = "cuda")]
     crate::pi05::register_builtin();
@@ -68,6 +69,25 @@ fn load_qwen3vl(
         .map_err(|error| Error::Other(format!("load {}: {error}", path.display())))?;
     let model = GeneralQwen3VL::from_weights_with_backend(config, tensors, backend)?;
     Ok(LoadedModel::text(Box::new(model)))
+}
+
+fn load_qwen_drive(
+    path: &Path,
+    device: Device,
+    backend: Arc<dyn Backend>,
+    options: &LoadOptions,
+) -> Result<LoadedModel> {
+    #[cfg(feature = "cuda")]
+    {
+        crate::qwen_drive::load::load_registered(path, device, backend, options)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (path, device, backend, options);
+        Err(Error::Other(
+            "qwen_drive planning requires the CUDA feature and a CUDA device".into(),
+        ))
+    }
 }
 
 fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {

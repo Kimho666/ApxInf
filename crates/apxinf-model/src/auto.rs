@@ -206,6 +206,15 @@ impl LoadedModel {
         self.vla()?.calibration_amax(request)
     }
 
+    /// Calibration capture that a token decoder may end at `stop_token`.
+    pub fn calibration_amax_stop(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+    ) -> Result<BTreeMap<String, f32>> {
+        self.vla()?.calibration_amax_stop(request, stop_token)
+    }
+
     pub fn calibration_plan(&self) -> Result<Vec<String>> {
         self.vla()?.calibration_plan()
     }
@@ -285,7 +294,12 @@ impl AutoModel {
             }
         };
 
-        if options.model_variant.is_some() && !matches!(model_name, "pi05" | "pi05-cuda") {
+        if options.model_variant.is_some()
+            && !matches!(
+                model_name,
+                "pi05" | "pi05-cuda" | "qwen_drive" | "qwen_drive-cuda"
+            )
+        {
             return Err(Error::Other(format!(
                 "model {model_name} does not yet support model_variant"
             )));
@@ -336,7 +350,11 @@ fn configure_cuda_tuning(
 ) -> Result<()> {
     use apxinf_cuda::tuning::{TuningDb, TuningMode, TuningPaths};
 
-    let default_paths = TuningPaths::for_cuda("configs/tuning", cuda.context().caps());
+    let default_paths = TuningPaths::resolve_for_cuda(
+        "configs/tuning",
+        cuda.context().caps(),
+        cuda.context().library_versions(),
+    );
     let model_root = if model_path.is_dir() {
         model_path
     } else {

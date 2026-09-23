@@ -15,6 +15,125 @@ use crate::context::CudaContext;
 use crate::cublas::CublasTranspose;
 use crate::tuning::{TacticStore, TuningDb, TuningMode, TuningPaths, TuningSession};
 
+/// BF16 `bias + weight @ vector`, with checkpoint-row-major weight `[N,K]`.
+/// Bias is the GEMM accumulator input, preserving the original matrix layout
+/// and avoiding a BF16 rounding between the dot product and the bias addition.
+pub fn bf16_addmv(
+    ctx: &CudaContext,
+    weight: &Tensor,
+    vector: &Tensor,
+    bias: &Tensor,
+) -> Result<Tensor> {
+    let w = weight.shape().dims();
+    if w.len() != 2
+        || w.contains(&0)
+        || vector.shape().dims() != [w[1]]
+        || bias.shape().dims() != [w[0]]
+    {
+        return Err(Error::Other(
+            "BF16 addmv expects weight[N,K], vector[K], bias[N]".into(),
+        ));
+    }
+    for tensor in [weight, vector, bias] {
+        if tensor.dtype() != DType::BF16 || tensor.device() != Device::Cuda(ctx.device_id()) {
+            return Err(Error::Other(
+                "BF16 addmv requires inputs on the context device".into(),
+            ));
+        }
+        checked_bytes(DType::BF16, tensor.shape().dims(), "BF16 addmv")?;
+    }
+    let k = i32::try_from(w[1]).map_err(|_| Error::Other("addmv input width overflow".into()))?;
+    let n = i32::try_from(w[0]).map_err(|_| Error::Other("addmv output width overflow".into()))?;
+    // Some cuBLAS BF16-output GEMV paths round the dot product before
+    // applying beta * C, even with FP32 compute. Keep C in FP32 until the
+    // bias has been added, then round once to satisfy the addmv contract.
+    let accumulator = crate::workspace::output_buffer(
+        ctx,
+        checked_bytes(DType::F32, &[w[0]], "BF16 addmv accumulator")?,
+    )?
+    .into_tensor(apxinf_core::Shape::new(vec![w[0]]), DType::F32);
+    super::linear_attention::cast_bf16_to_f32(ctx, bias, &accumulator)?;
+    let wp = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
+    let xp = CudaBuffer::from_tensor(vector).map_err(Error::Cuda)?;
+    let cp = CudaBuffer::from_tensor(&accumulator).map_err(Error::Cuda)?;
+    ctx.cublas()
+        .gemm_bf16_f32_ex(
+            CublasTranspose::None,
+            CublasTranspose::Transpose,
+            1,
+            w[0],
+            w[1],
+            1.0,
+            &xp,
+            k,
+            &wp,
+            k,
+            1.0,
+            &cp,
+            n,
+        )
+        .map_err(Error::Cuda)?;
+    let output = crate::workspace::output_buffer(ctx, bias.size_in_bytes())?
+        .into_tensor(apxinf_core::Shape::new(vec![w[0]]), DType::BF16);
+    super::linear_attention::cast_f32_to_bf16(ctx, &accumulator, &output)?;
+    Ok(output)
+}
+
+/// BF16 linear projection with bias added before the final BF16 output rounding.
+/// Uses the bias epilogue's default legal cuBLASLt heuristic, separate from
+/// plain-GEMM tactics whose epilogue contract does not include a bias.
+pub fn bf16_bias(ctx: &CudaContext, x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let a = x.shape().dims();
+    let b = weight.shape().dims();
+    if a.len() != 2 || b.len() != 2 || a[1] != b[0] || bias.shape().dims() != [b[1]] {
+        return Err(Error::Other(
+            "BF16 biased GEMM expects [M,K] @ [K,N] + [N]".into(),
+        ));
+    }
+    for t in [x, weight, bias] {
+        if t.dtype() != DType::BF16 || t.device() != Device::Cuda(ctx.device_id()) {
+            return Err(Error::Other(
+                "biased GEMM requires BF16 inputs on the context device".into(),
+            ));
+        }
+        checked_bytes(DType::BF16, t.shape().dims(), "biased GEMM")?;
+    }
+    let int = |v: usize| {
+        i32::try_from(v).map_err(|_| Error::Other("biased GEMM dimension overflow".into()))
+    };
+    let (m, k, n) = (int(a[0])?, int(a[1])?, int(b[1])?);
+    let out = crate::workspace::output_buffer(
+        ctx,
+        checked_bytes(DType::BF16, &[a[0], b[1]], "biased GEMM output")?,
+    )?;
+    let xp = CudaBuffer::from_tensor(x).map_err(Error::Cuda)?;
+    let wp = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
+    let bp = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+    unsafe {
+        if crate::workspace::may_prepare_native_resources() {
+            crate::ffi::check_cublas(crate::ffi::apxinf_static_prepare_bf16_gemm_bias(
+                m,
+                n,
+                k,
+                bp.ptr(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        crate::ffi::check_cublas(crate::ffi::apxinf_static_bf16_gemm_bias(
+            xp.ptr(),
+            wp.ptr(),
+            bp.ptr(),
+            out.ptr(),
+            m,
+            n,
+            k,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(out.into_tensor(apxinf_core::Shape::new(vec![a[0], b[1]]), DType::BF16))
+}
+
 pub(crate) use fp8::resolve_fused_plan as resolve_fused_fp8_plan;
 pub(crate) use plan::GemmPlanCache;
 pub use plan::{PlanSource, PreparedGemmPlan};
@@ -293,5 +412,66 @@ mod contract_tests {
             Device::Cuda(0),
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod addmv_graph_tests {
+    use super::*;
+    use half::bf16;
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn addmv_capture_replays_updated_bias() {
+        let ctx = CudaContext::new(0).unwrap();
+        let (n, k) = (1024, 256);
+        let upload = |shape, values: &[bf16]| {
+            crate::transfers::to_cuda(&Tensor::from_bf16(shape, values).unwrap(), 0).unwrap()
+        };
+        let mut weights = vec![bf16::from_f32(1.0 / 4096.0); n * k];
+        for row in 0..n {
+            weights[row * k] = bf16::ONE;
+        }
+        let weight = upload(vec![n, k], &weights);
+        let vector = upload(vec![k], &vec![bf16::ONE; k]);
+        let bias = upload(vec![n], &vec![bf16::from_f32(-1.0); n]);
+        let workspace = crate::workspace::GraphWorkspace::new(8192, 0).unwrap();
+        let invoke = || bf16_addmv(&ctx, &weight, &vector, &bias);
+        let eager = crate::workspace::prepare_with_workspace(&workspace, invoke).unwrap();
+        ctx.synchronize().unwrap();
+        let expected = crate::transfers::to_cpu(&eager)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        crate::graph::begin(&ctx, crate::graph::CaptureMode::ThreadLocal).unwrap();
+        let result = crate::workspace::with_workspace(&workspace, invoke);
+        if result.is_err() {
+            crate::graph::abort(&ctx);
+        }
+        let output = result.unwrap();
+        let graph = crate::graph::end(&ctx).unwrap();
+        for _ in 0..3 {
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                crate::transfers::to_cpu(&output)
+                    .unwrap()
+                    .to_f32_vec()
+                    .unwrap(),
+                expected
+            );
+        }
+        let changed = Tensor::from_bf16(vec![n], &vec![bf16::ZERO; n]).unwrap();
+        crate::transfers::copy_cpu_to_cuda(&changed, &bias).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        let actual = crate::transfers::to_cpu(&output)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        assert_eq!(
+            actual,
+            vec![bf16::from_f32(1.0 + (k - 1) as f32 / 4096.0).to_f32(); n]
+        );
     }
 }
