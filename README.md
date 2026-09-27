@@ -86,6 +86,8 @@ actions = client.infer(observation)["actions"]
 
 ## Performance
 
+### PI0.5
+
 Two views, 224x224 NHWC `uint8`, 10 flow steps, `H=10`, batch 1. Latency is
 steady-state CUDA Graph replay P50.
 
@@ -114,6 +116,15 @@ is 92.4%.
 | Jetson AGX Thor | BF16 | 500 | 464 | 92.8% |
 | Jetson AGX Thor | FP8 | 500 | 461 | 92.2% |
 | Jetson AGX Orin | BF16 | 500 | 460 | 92.0% |
+
+### PI0-FAST
+
+Two views, 224x224 NHWC `uint8`, batch 1.
+
+| Hardware | Precision | Prefix | Per Token |
+|---|---|---:|---:|
+| Jetson AGX Thor | BF16 | 33.1 ms | 17.16 ms |
+| Jetson AGX Thor | FP8 | 31.0 ms | 9.68 ms |
 
 
 ## Port a new model with an agent
