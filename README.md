@@ -125,6 +125,7 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 |---|---|---:|---:|
 | Jetson AGX Thor | BF16 | 33.1 ms | 17.16 ms |
 | Jetson AGX Thor | FP8 | 31.0 ms | 9.68 ms |
+| Jetson AGX Orin | BF16 | 117.3 ms | 25.34 ms |
 | RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
 
 
