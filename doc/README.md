@@ -22,9 +22,12 @@ describe implemented code. WallOSS/GR00T and LLM/VLM retain their own organizati
 read the coverage table before assuming identical readiness or config support.
 
 Qwen-Drive follows the same `model/`, `model_runner/`, `weights/` separation as a
-planning-only VLA runtime. Its [loading, request and validation contract](qwen-drive-planning.md)
-covers the supported modes and limits; [per-device kernel policy, tactic stores and the
-measurement protocol](qwen-drive-devices.md) cover Orin, Thor and the RTX 4090.
+planning-only VLA runtime. Its [benchmark and validation guide](qwen-drive-benchmark.md)
+records measured performance, accuracy, reproduction steps and runtime limits.
+
+Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
+`weights`/`model`/`model_runner` owners as single files.
+[CLI inference, benchmarking and limits](qwen38-nvfp4.md) cover Jetson Thor.
 
 ## Agent workflows
 

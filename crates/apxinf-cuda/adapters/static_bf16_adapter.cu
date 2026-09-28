@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <limits>
+#include <cstdint>
 #include <cstdint>
 
 namespace {
@@ -23,6 +25,44 @@ namespace {
 
 int blocks_for(int64_t count) {
   return static_cast<int>((count + kThreads - 1) / kThreads);
+}
+// A load-ahead CTA reads the whole projection/residual row before writing
+// hidden. The __restrict__ specialization also requires both output ranges
+// to be disjoint from all read-only input ranges and from each other. Inputs
+// may alias one another, because none is written by this kernel.
+bool byte_ranges_disjoint(const void* first, size_t first_bytes,
+                          const void* second, size_t second_bytes) {
+  if (first == nullptr || second == nullptr) return false;
+  const uintptr_t a = reinterpret_cast<uintptr_t>(first);
+  const uintptr_t b = reinterpret_cast<uintptr_t>(second);
+  if (first_bytes > std::numeric_limits<uintptr_t>::max() - a ||
+      second_bytes > std::numeric_limits<uintptr_t>::max() - b)
+    return false;
+  return a <= b ? b - a >= first_bytes : a - b >= second_bytes;
+}
+
+bool layer_norm_1024_load_ahead_noalias(
+    const void* projection, const void* residual,
+    const void* norm_weight, const void* norm_bias,
+    const void* hidden, const void* normalized, int rows) {
+  constexpr size_t kRowBytes = 1024 * sizeof(__nv_bfloat16);
+  if (rows <= 0 || static_cast<size_t>(rows) >
+                       std::numeric_limits<size_t>::max() / kRowBytes)
+    return false;
+  const size_t matrix_bytes = static_cast<size_t>(rows) * kRowBytes;
+  const void* inputs[] = {projection, residual, norm_weight, norm_bias};
+  const size_t input_bytes[] = {matrix_bytes, matrix_bytes,
+                                kRowBytes, kRowBytes};
+  const void* outputs[] = {hidden, normalized};
+  if (!byte_ranges_disjoint(hidden, matrix_bytes, normalized, matrix_bytes))
+    return false;
+  for (const void* output : outputs) {
+    for (int i = 0; i < 4; ++i) {
+      if (!byte_ranges_disjoint(output, matrix_bytes, inputs[i], input_bytes[i]))
+        return false;
+    }
+  }
+  return true;
 }
 }  // namespace
 
@@ -98,6 +138,25 @@ extern "C" cudaError_t apxinf_static_bias_activation_bf16(
         static_cast<const __nv_bfloat16*>(bias),
         static_cast<__nv_bfloat16*>(output), count, cols, activation);
   }
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_bias_activation_bf16_packed8(
+    const void* input, const void* bias, void* output,
+    int rows, int cols, int activation, cudaStream_t stream) {
+  if (input == nullptr || bias == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || cols % 8 != 0 || (activation != 0 && activation != 1))
+    return cudaErrorInvalidValue;
+  if (reinterpret_cast<uintptr_t>(input) % alignof(Bf16x8) != 0 ||
+      reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x8) != 0 ||
+      reinterpret_cast<uintptr_t>(output) % alignof(Bf16x8) != 0)
+    return cudaErrorInvalidValue;
+  const int64_t oct_count = static_cast<int64_t>(rows) * cols / 8;
+  bias_activation_bf16_packed8_kernel<<<
+      blocks_for(oct_count), kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_bfloat16*>(output), oct_count, cols, activation);
   return cudaGetLastError();
 }
 
@@ -292,6 +351,50 @@ extern "C" cudaError_t apxinf_static_bias_residual_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_bias_residual_bf16_packed4(
+    const void* projection, const void* bias, const void* residual,
+    void* output, int rows, int cols, cudaStream_t stream) {
+  if (projection == nullptr || bias == nullptr || residual == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || (cols & 3) != 0)
+    return cudaErrorInvalidValue;
+  const uintptr_t pointers = reinterpret_cast<uintptr_t>(projection) |
+      reinterpret_cast<uintptr_t>(residual) |
+      reinterpret_cast<uintptr_t>(output) |
+      reinterpret_cast<uintptr_t>(bias);
+  if ((pointers & (alignof(Bf16x4) - 1)) != 0)
+    return cudaErrorInvalidValue;
+  const int64_t packed_count = static_cast<int64_t>(rows) * (cols / 4);
+  bias_residual_bf16_packed4_kernel<<<
+      blocks_for(packed_count), kThreads, 0, stream>>>(
+      static_cast<const Bf16x4*>(projection),
+      static_cast<const Bf16x4*>(bias),
+      static_cast<const Bf16x4*>(residual),
+      static_cast<Bf16x4*>(output), packed_count, cols / 4);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_then_residual_bf16_packed4(
+    const void* projection, const void* bias, const void* residual,
+    void* output, int rows, int cols, cudaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || output == nullptr ||
+      rows <= 0 || cols <= 0 || (cols & 3) != 0)
+    return cudaErrorInvalidValue;
+  const uintptr_t pointers = reinterpret_cast<uintptr_t>(projection) |
+      reinterpret_cast<uintptr_t>(residual) |
+      reinterpret_cast<uintptr_t>(output) |
+      reinterpret_cast<uintptr_t>(bias);
+  if ((pointers & (alignof(Bf16x4) - 1)) != 0)
+    return cudaErrorInvalidValue;
+  const int64_t packed_count = static_cast<int64_t>(rows) * (cols / 4);
+  bias_then_residual_bf16_packed4_kernel<<<
+      blocks_for(packed_count), kThreads, 0, stream>>>(
+      static_cast<const Bf16x4*>(projection),
+      static_cast<const Bf16x4*>(bias),
+      static_cast<const Bf16x4*>(residual),
+      static_cast<Bf16x4*>(output), packed_count, cols / 4);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_bias_then_residual_bf16(
     const void* projection, const void* bias, const void* residual,
     void* output, int rows, int cols, cudaStream_t stream) {
@@ -416,6 +519,37 @@ extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_bf16(
     const void* residual, const void* norm_weight, const void* norm_bias,
     void* hidden, void* normalized, int rows, int cols, float eps,
     cudaStream_t stream) {
+  // The 1024-column, no-projection-bias path may use the disjoint-buffer
+  // load-ahead specialization. Aliased buffers use the generic implementation.
+  if (cols == 1024 && projection_bias == nullptr) {
+    if (layer_norm_1024_load_ahead_noalias(
+            projection, residual, norm_weight, norm_bias,
+            hidden, normalized, rows)) {
+      bias_residual_layer_norm_bf16_carry_1024_load_ahead_kernel<<<
+          rows, kThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(projection), nullptr,
+          static_cast<const __nv_bfloat16*>(residual),
+          static_cast<const __nv_bfloat16*>(norm_weight),
+          static_cast<const __nv_bfloat16*>(norm_bias),
+          static_cast<__nv_bfloat16*>(hidden),
+          static_cast<__nv_bfloat16*>(normalized), rows, cols, eps);
+      return cudaGetLastError();
+    }
+  }
+
+  // Qwen-Drive vision uses 1024 columns and no projection bias. Retain the
+  // original generic kernel for every other call shape or bias mode.
+  if (cols == 1024 && projection_bias == nullptr) {
+    bias_residual_layer_norm_bf16_carry_1024_kernel<<<rows, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(projection),
+        nullptr,
+        static_cast<const __nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(norm_weight),
+        static_cast<const __nv_bfloat16*>(norm_bias),
+        static_cast<__nv_bfloat16*>(hidden),
+        static_cast<__nv_bfloat16*>(normalized), rows, cols, eps);
+    return cudaGetLastError();
+  }
   bias_residual_layer_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(projection),
       static_cast<const __nv_bfloat16*>(projection_bias),
@@ -424,6 +558,109 @@ extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_bf16(
       static_cast<const __nv_bfloat16*>(norm_bias),
       static_cast<__nv_bfloat16*>(hidden),
       static_cast<__nv_bfloat16*>(normalized), rows, cols, eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* norm_weight, const void* norm_bias,
+    void* hidden, void* normalized, int rows, int cols, float eps,
+    float scale, cudaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || norm_weight == nullptr ||
+      norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
+      rows <= 0 || cols <= 0 || !std::isfinite(scale) || scale <= 0.0f)
+    return cudaErrorInvalidValue;
+  bias_residual_layer_norm_quant_bf16_e4m3_kernel<<<
+      rows, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(projection),
+      static_cast<const __nv_bfloat16*>(projection_bias),
+      static_cast<const __nv_bfloat16*>(residual),
+      static_cast<const __nv_bfloat16*>(norm_weight),
+      static_cast<const __nv_bfloat16*>(norm_bias),
+      static_cast<__nv_bfloat16*>(hidden),
+      static_cast<__nv_fp8_e4m3*>(normalized), rows, cols, eps, 1.0f / scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t
+apxinf_static_bias_then_residual_adaptive_layer_norm_bf16_cached_1536(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* modulation,
+    void* hidden, void* normalized, int rows, int cols, float eps,
+    cudaStream_t stream) {
+  if (projection == nullptr || projection_bias == nullptr ||
+      residual == nullptr || modulation == nullptr || hidden == nullptr ||
+      normalized == nullptr || rows <= 0 || cols != 1536)
+    return cudaErrorInvalidValue;
+  bias_then_residual_adaptive_layer_norm_bf16_cached_1536_kernel
+      <<<rows, kThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(projection),
+          static_cast<const __nv_bfloat16*>(projection_bias),
+          static_cast<const __nv_bfloat16*>(residual),
+          static_cast<const __nv_bfloat16*>(modulation),
+          static_cast<__nv_bfloat16*>(hidden),
+          static_cast<__nv_bfloat16*>(normalized), rows, eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t
+apxinf_static_bias_then_residual_layer_norm_bf16_cached_1536(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* norm_weight, const void* norm_bias,
+    void* hidden, void* normalized, int rows, int cols, float eps,
+    cudaStream_t stream) {
+  if (projection == nullptr || projection_bias == nullptr ||
+      residual == nullptr || norm_weight == nullptr || norm_bias == nullptr ||
+      hidden == nullptr || normalized == nullptr || rows <= 0 || cols != 1536)
+    return cudaErrorInvalidValue;
+  bias_then_residual_layer_norm_bf16_cached_1536_kernel
+      <<<rows, kThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(projection),
+          static_cast<const __nv_bfloat16*>(projection_bias),
+          static_cast<const __nv_bfloat16*>(residual),
+          static_cast<const __nv_bfloat16*>(norm_weight),
+          static_cast<const __nv_bfloat16*>(norm_bias),
+          static_cast<__nv_bfloat16*>(hidden),
+          static_cast<__nv_bfloat16*>(normalized), rows, eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_gelu_bf16_packed8(
+    const void* input, const void* bias, void* output,
+    int rows, int cols, cudaStream_t stream) {
+  if (input == nullptr || bias == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || cols % 8 != 0 ||
+      reinterpret_cast<uintptr_t>(input) % alignof(Bf16Pairx8) != 0 ||
+      reinterpret_cast<uintptr_t>(bias) % alignof(Bf16Pairx8) != 0 ||
+      reinterpret_cast<uintptr_t>(output) % alignof(Bf16Pairx8) != 0)
+    return cudaErrorInvalidValue;
+  const int64_t octet_count = static_cast<int64_t>(rows) * cols / 8;
+  const int threads = rows >= 512 ? 256 : 128;
+  const int blocks = static_cast<int>((octet_count + threads - 1) / threads);
+  bias_gelu_bf16_packed8_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const Bf16Pairx8*>(input), static_cast<const Bf16Pairx8*>(bias),
+      static_cast<Bf16Pairx8*>(output), octet_count, cols / 8);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_bf16_cached_1024(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* norm_weight, const void* norm_bias,
+    void* hidden, void* normalized, int rows, int cols, float eps,
+    cudaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || norm_weight == nullptr ||
+      norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
+      rows <= 0 || cols != 1024)
+    return cudaErrorInvalidValue;
+  bias_residual_layer_norm_bf16_cached_1024_kernel
+      <<<rows, kThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(projection),
+          static_cast<const __nv_bfloat16*>(projection_bias),
+          static_cast<const __nv_bfloat16*>(residual),
+          static_cast<const __nv_bfloat16*>(norm_weight),
+          static_cast<const __nv_bfloat16*>(norm_bias),
+          static_cast<__nv_bfloat16*>(hidden),
+          static_cast<__nv_bfloat16*>(normalized), rows, eps);
   return cudaGetLastError();
 }
 
@@ -550,7 +787,9 @@ extern "C" cudaError_t apxinf_static_vision_qkv_rope_bf16(
       !(theta > 0.0f)) {
     return cudaErrorInvalidValue;
   }
-  vision_qkv_rope_kernel<__nv_bfloat16><<<tokens, kThreads, 0, stream>>>(
+  // Two axes of head_dim/4 rotations, held as sine then cosine.
+  const size_t rope_smem = static_cast<size_t>(head_dim) * sizeof(float);
+  vision_qkv_rope_kernel<__nv_bfloat16><<<tokens, kThreads, rope_smem, stream>>>(
       static_cast<const __nv_bfloat16*>(qkv),
       static_cast<const __nv_bfloat16*>(bias), position_ids,
       static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(k),
@@ -568,7 +807,8 @@ extern "C" cudaError_t apxinf_static_vision_qkv_rope_f16(
       !(theta > 0.0f)) {
     return cudaErrorInvalidValue;
   }
-  vision_qkv_rope_kernel<half><<<tokens, kThreads, 0, stream>>>(
+  const size_t rope_smem = static_cast<size_t>(head_dim) * sizeof(float);
+  vision_qkv_rope_kernel<half><<<tokens, kThreads, rope_smem, stream>>>(
       static_cast<const half*>(qkv),
       static_cast<const __nv_bfloat16*>(bias), position_ids,
       static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(k),
@@ -651,5 +891,23 @@ extern "C" cudaError_t apxinf_static_bias_position_f32_bf16(
       static_cast<const float*>(bias),
       static_cast<const float*>(position),
       static_cast<__nv_bfloat16*>(output), count, cols, tokens_per_view);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_vision_qk_rope_bf16_no_v(
+    const void* qkv, const uint32_t* position_ids,
+    void* q, void* k, int tokens, int heads, int head_dim,
+    float theta, cudaStream_t stream) {
+  if (qkv == nullptr || position_ids == nullptr || q == nullptr ||
+      k == nullptr || tokens <= 0 || heads <= 0 ||
+      head_dim <= 0 || head_dim > 256 || head_dim % 4 != 0 ||
+      !(theta > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t rope_smem = static_cast<size_t>(head_dim) * sizeof(float);
+  vision_qkv_rope_kernel<__nv_bfloat16, true><<<tokens, kThreads, rope_smem, stream>>>(
+      static_cast<const __nv_bfloat16*>(qkv), nullptr, position_ids,
+      static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(k),
+      nullptr, tokens, heads, head_dim, theta);
   return cudaGetLastError();
 }

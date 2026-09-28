@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +12,64 @@ import pytest
 from apxinf import AutoPolicy, Gr00tPolicy, Policy
 from apxinf.calibration import CalibrationContext, CalibrationRunner, ConsumerContract
 from apxinf.policies import available_policies, get_policy
+
+
+@pytest.mark.parametrize("precision", ["bf16", "int8", "fp8"])
+def test_prepared_directory_loads_without_backbone(tmp_path, monkeypatch, precision):
+    import json
+    import sys
+    from apxinf.policies.impls.gr00t import _NvidiaProcessorAdapter
+
+    model, source = tmp_path / "model", tmp_path / "source"
+    model.mkdir()
+    source.mkdir()
+    (model / "config.json").write_text('{"model_type":"Gr00tN1d7"}')
+    (model / "model.safetensors").write_bytes(b"primary-v1")
+    for name in ("config.json", "tokenizer_config.json", "preprocessor_config.json", "tokenizer.json"):
+        (source / name).write_bytes(b"{}\n")
+    bundle = Gr00tPolicy.prepare_assets(model, source)
+    identity = Gr00tPolicy.checkpoint_identity(model)
+    # Independent byte-protocol vector: this fixture also has a primary config.
+    assert identity == "sha256:48b31c2a57686509f82b84ea2e7f9c5c017454b764d40da03f9d72778c583919"
+    # A profile made before GR00T processor metadata was included must not match.
+    assert identity != "sha256:652d1192021049f00f97e3450a39f340271cbd5d97f3d37c10d91feffb0004d6"
+    assert identity == Gr00tPolicy.checkpoint_identity(model, bundle)
+    calls = []
+
+    def load_processor(path, *, backbone, **kwargs):
+        assert path == model
+        assert backbone == bundle
+        return _FakeProcessor()
+
+    def load_native(model_name, path, **kwargs):
+        assert model_name == "gr00t" and path == str(model)
+        assert kwargs["assets"] == {"backbone": str(bundle)}
+        calls.append(kwargs)
+        return _FakeModel()
+
+    monkeypatch.setattr(_NvidiaProcessorAdapter, "load", load_processor)
+    monkeypatch.setitem(sys.modules, "apxinf_py", SimpleNamespace(ModelRunner=SimpleNamespace(load=load_native)))
+    calibration = model / "calibration.json"
+    calibration.write_text(json.dumps({"model": {"checkpoint": identity}}))
+    kwargs = {"calibration": calibration} if precision == "fp8" else {}
+    automatic = AutoPolicy.from_pretrained(model, precision=precision, **kwargs)
+    explicit = AutoPolicy.from_pretrained(model, backbone=bundle, precision=precision, **kwargs)
+    assert calls[0] == calls[1]
+    noise = np.zeros((1, 4, 6), dtype=np.float32)
+    left, right = automatic.infer({}, noise=noise), explicit.infer({}, noise=noise)
+    for key in ("actions", "normalized_actions", "noise"):
+        assert np.array_equal(left[key], right[key])
+
+
+def test_missing_default_resources_fail_before_native_or_processor_load(tmp_path, monkeypatch):
+    from apxinf.policies.impls.gr00t import _NvidiaProcessorAdapter
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("processor must not load before default resource validation")
+
+    monkeypatch.setattr(_NvidiaProcessorAdapter, "load", unexpected)
+    with pytest.raises(FileNotFoundError, match="prepare_assets"):
+        Gr00tPolicy.from_pretrained(tmp_path)
 
 
 class _FakeModel:
@@ -241,6 +301,57 @@ def test_checkpoint_identity_covers_primary_and_backbone(tmp_path):
 
     (backbone / "model.safetensors").write_bytes(b"backbone-v2")
     assert identity != Gr00tPolicy.checkpoint_identity(primary, backbone)
+
+
+def test_explicit_legacy_snapshot_does_not_preserve_old_calibration_identity(tmp_path):
+    primary, backbone = tmp_path / "primary", tmp_path / "backbone"
+    old = hashlib.sha256()
+    for name, root, content in (
+        ("primary", primary, b"primary-v1"),
+        ("backbone", backbone, b"backbone-v1"),
+    ):
+        root.mkdir()
+        (root / "model.safetensors").write_bytes(content)
+        file_identity = "sha256:" + hashlib.sha256(b"model.safetensors\0" + content).hexdigest()
+        old.update(name.encode() + b"\0" + file_identity.encode("ascii") + b"\0")
+    assert Gr00tPolicy.checkpoint_identity(primary, backbone) != "sha256:" + old.hexdigest()
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "config.json", "processor/config.json", "processor/embodiment_id.json",
+        "processor/processor_config.json", "processor/statistics.json",
+    ],
+)
+def test_processor_mutation_changes_calibration_checkpoint(tmp_path, prepared, relative):
+    primary, source = tmp_path / "primary", tmp_path / "source"
+    primary.mkdir()
+    source.mkdir()
+    (primary / "processor").mkdir()
+    (primary / "model.safetensors").write_bytes(b"primary-v1")
+    (source / "model.safetensors").write_bytes(b"backbone-v1")
+    for name in ("config.json", "tokenizer_config.json", "preprocessor_config.json", "tokenizer.json"):
+        (source / name).write_text("{}")
+    for name in (
+        "config.json", "processor/config.json", "processor/embodiment_id.json",
+        "processor/processor_config.json", "processor/statistics.json",
+    ):
+        (primary / name).write_text("{}")
+    backbone = Gr00tPolicy.prepare_assets(primary, source) if prepared else source
+    identity = Gr00tPolicy.checkpoint_identity(primary, backbone)
+    policy = Gr00tPolicy(_FakeModel(), processor=_FakeProcessor(), action_dim=3)
+    profile = CalibrationRunner(
+        policy,
+        policy.calibration_plan(),
+        checkpoint=identity,
+        data_identity="sha256:fixed-observations",
+        source_revision="test-revision",
+        device={"requested": "cuda:0", "host": "test-host"},
+    ).run([{"prompt": "test"}])
+    (primary / relative).write_text('{"changed": true}')
+    assert profile["model"]["checkpoint"] != Gr00tPolicy.checkpoint_identity(primary, backbone)
 
 
 def test_w8a8_is_not_a_public_precision_name(tmp_path):

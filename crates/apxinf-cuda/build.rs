@@ -1,5 +1,7 @@
 use std::env;
 
+#[path = "aot/link.rs"]
+mod aot;
 #[path = "build_support/cuda_arch.rs"]
 mod cuda_arch;
 
@@ -152,8 +154,7 @@ fn is_fa2_sm80_family(arch: &str) -> bool {
 // kernels. The sm80 family and Blackwell (sm_120/121, GB10/DGX Spark) all run
 // the same v2.7.4 instantiations; the -arch flag selects the real target.
 fn is_fa2_bf16_arch(arch: &str) -> bool {
-    is_fa2_sm80_family(arch)
-        || matches!(arch, "sm_120" | "sm_120a" | "sm_121" | "sm_121a")
+    is_fa2_sm80_family(arch) || matches!(arch, "sm_120" | "sm_120a" | "sm_121" | "sm_121a")
 }
 
 fn is_cutlass_sm89_family(arch: &str) -> bool {
@@ -161,6 +162,8 @@ fn is_cutlass_sm89_family(arch: &str) -> bool {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(apxinf_aot_sm110)");
+    println!("cargo:rustc-check-cfg=cfg(nvtx_header)");
     println!("cargo:rustc-check-cfg=cfg(nvtx_v2)");
     println!("cargo:rustc-check-cfg=cfg(nvtx_v3)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_fmha)");
@@ -174,7 +177,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
-    println!("cargo:rerun-if-env-changed=APXINF_FA2_TRIM_UNUSED");
+    // A build input location, not an inference-time optimization switch.
+    println!("cargo:rerun-if-env-changed=APXINF_CUDA_AOT_MANIFEST");
+    println!("cargo:rerun-if-changed=aot/link.rs");
+    println!("cargo:rerun-if-changed=aot/bundle.rs");
+    println!("cargo:rerun-if-changed=aot/manifest.json");
+    println!("cargo:rerun-if-env-changed=APXINF_FA2_HEAD64_MAXREG");
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-env-changed=NVIDIA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
@@ -231,15 +239,24 @@ fn main() {
                 std::path::Path::new(&format!("{d}/libnvToolsExt.so")).exists()
                     || std::path::Path::new(&format!("{d}/libnvToolsExt.so.1")).exists()
             });
-            if has_v3 {
+            let header = format!("{cuda_path}/include/nvtx3/nvToolsExt.h");
+            if std::path::Path::new(&header).exists() {
+                println!("cargo:rerun-if-changed=adapters/nvtx.c");
+                println!("cargo:rerun-if-changed={header}");
+                cc::Build::new()
+                    .file("adapters/nvtx.c")
+                    .include(format!("{cuda_path}/include"))
+                    .compile("apxinf_nvtx");
+                println!("cargo:rustc-link-lib=dl");
+                println!("cargo:rustc-cfg=nvtx_header");
+            } else if has_v3 {
                 // Desktop CUDA 12.x. `nvtx.rs` will use `#[link(name = "nvtx3interop")]`.
                 println!("cargo:rustc-cfg=nvtx_v3");
             } else if has_v2 {
                 // Drive OS / embedded CUDA. `nvtx.rs` falls back to `-lnvToolsExt`.
                 println!("cargo:rustc-cfg=nvtx_v2");
             } else {
-                println!("cargo:warning=NVTX feature enabled but neither libnvtx3interop nor libnvToolsExt found in any of {lib_dirs:?} — build will fail at link time");
-                println!("cargo:rustc-cfg=nvtx_v3"); // preserve prior behavior
+                println!("cargo:warning=NVTX unavailable: no NVTX3 headers or legacy libraries; markers disabled");
             }
             // Suppress the "unexpected cfg" warning under Rust 1.80+ check-cfg.
         }
@@ -301,6 +318,21 @@ fn main() {
             }
             let nvcc_arch = Some(selection.nvcc_arch);
             let cutlass_arch = Some(selection.cutlass_arch);
+            let aot_manifest =
+                env::var_os("APXINF_CUDA_AOT_MANIFEST").map(std::path::PathBuf::from);
+            if matches!(nvcc_arch.as_deref(), Some("sm_110" | "sm_110a")) && aot_manifest.is_none()
+            {
+                println!("cargo:warning=SM110 AOT bundle is absent; fixed BF16 operators are unavailable. See crates/apxinf-cuda/aot/README.md");
+            }
+            let aot_bundle = aot_manifest.map(|path| {
+                aot::Bundle::load(
+                    std::path::Path::new(&manifest_dir),
+                    std::path::Path::new(&path),
+                    &target,
+                    nvcc_arch.as_deref().unwrap(),
+                    std::path::Path::new(&nvcc),
+                )
+            });
             let kernel_build_id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
                 computed_kernel_build_id(
                     std::path::Path::new(&manifest_dir),
@@ -309,6 +341,14 @@ fn main() {
                     cutlass_arch.as_deref(),
                 )
             });
+            let kernel_build_id = match &aot_bundle {
+                Some(bundle) => {
+                    let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+                    hash_bytes(&mut hash, bundle.fingerprint.as_bytes());
+                    format!("{kernel_build_id}-aot-{hash:032x}")
+                }
+                None => kernel_build_id,
+            };
             emit_kernel_build_id(&kernel_build_id);
 
             // Compile host adapters from an explicit list. Template-heavy
@@ -328,6 +368,32 @@ fn main() {
                 kernel_files.iter().all(|path| path.is_file()),
                 "one or more required CUDA adapters are missing under {adapters_dir}"
             );
+
+            if let Some(bundle) = &aot_bundle {
+                bundle.kernel("gemm-swiglu-bf16");
+                bundle.kernel("gdn-prefill-bf16");
+                kernel_files
+                    .push(std::path::Path::new(&adapters_dir).join("gdn_bf16_aot_adapter.cu"));
+                kernel_files
+                    .push(std::path::Path::new(&adapters_dir).join("quack_m256n256_adapter.cu"));
+                for id in [
+                    "language-attention",
+                    "action-attention",
+                    "vision-attention-624",
+                    "vision-attention-2200",
+                ] {
+                    bundle.kernel(id);
+                }
+                for file in [
+                    "fa4_d256_native_adapter.cu",
+                    "fa4_d256_split_batch_adapter.cu",
+                    "fa4_d256_split_batch_merge.cu",
+                    "fa4_fixed_groups_adapter.cu",
+                ] {
+                    kernel_files.push(std::path::Path::new(&adapters_dir).join(file));
+                }
+                println!("cargo:rustc-cfg=apxinf_aot_sm110");
+            }
 
             let cutlass_root = std::path::Path::new(&kernels_dir).join("cutlass");
             let cutlass_fmha_operator = cutlass_root.join("fmha_sm100.cu");
@@ -438,6 +504,7 @@ fn main() {
             let fa2_compat = cutlass_root.join("fa2_compat");
             let fa2_operator = cutlass_root.join("fa2_bf16_sm80.cu");
             let fa2_hdim64_apx = cutlass_root.join("fa2_hdim64_bf16.cu");
+            let fa2_hdim96_apx = cutlass_root.join("fa2_hdim96_bf16.cu");
             let fa2_wrapper = std::path::Path::new(&adapters_dir).join("fa2_adapter.cu");
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
@@ -455,6 +522,7 @@ fn main() {
                 assert!(
                     fa2_operator.is_file()
                         && fa2_hdim64_apx.is_file()
+                        && fa2_hdim96_apx.is_file()
                         && fa2_wrapper.is_file()
                         && fa2_hdim96.is_file()
                         && fa2_hdim128.is_file()
@@ -468,6 +536,7 @@ fn main() {
                 fa2_sources.extend([
                     fa2_wrapper.clone(),
                     fa2_hdim64_apx,
+                    fa2_hdim96_apx,
                     fa2_hdim96,
                     fa2_hdim128,
                     fa2_hdim256,
@@ -491,7 +560,8 @@ fn main() {
                 if fa2_head_special {
                     fa2_sources
                         .push(std::path::Path::new(&adapters_dir).join("fa2_head64_adapter.cu"));
-                    fa2_sources.push(std::path::Path::new(&adapters_dir).join("fa2_head256_adapter.cu"));
+                    fa2_sources
+                        .push(std::path::Path::new(&adapters_dir).join("fa2_head256_adapter.cu"));
                 }
                 if fa2_f16_sm100 {
                     println!("cargo:rustc-cfg=apxinf_fa2_f16_sm100");
@@ -543,6 +613,11 @@ fn main() {
                         "-O3",
                         "-std=c++17",
                     ]);
+                    if let Some(bundle) = &aot_bundle {
+                        for kernel in bundle.kernels.values() {
+                            cmd.arg(format!("-I{}", kernel.header.parent().unwrap().display()));
+                        }
+                    }
                     let selected_arch = if entry == &cutlass_fmha
                         || entry == &cutlass_gemm_operator
                         || entry == &cutlass_fp8_dual_operator
@@ -602,14 +677,12 @@ fn main() {
                         }
                     }
                     if fa2_sources.contains(entry) {
-                        cmd.args([
-                            "--expt-relaxed-constexpr",
-                            "--expt-extended-lambda",
-                        ]);
+                        cmd.args(["--expt-relaxed-constexpr", "--expt-extended-lambda"]);
                         // Reference SDPA specializations use libdevice exp/log in the
                         // split combiner; fast math changes BF16 output rounding.
                         if !entry.ends_with("fa2_head256_adapter.cu")
-                            && !entry.ends_with("fa2_head64_adapter.cu") {
+                            && !entry.ends_with("fa2_head64_adapter.cu")
+                        {
                             cmd.arg("--use_fast_math");
                         }
                         cmd.args([
@@ -631,6 +704,23 @@ fn main() {
                                 || entry.ends_with("fa2_head256_adapter.cu"))
                         {
                             cmd.arg("-DAPXINF_FA2_HEAD_SPECIAL=1");
+                        }
+                        // The head-64 vision kernel is latency-bound at 16.67%
+                        // theoretical occupancy: ptxas gives it 244 registers,
+                        // which together with its 73.7 KB of shared memory caps
+                        // residency at two blocks per SM on a 20-SM part.
+                        //
+                        // Capping the count buys a third block and loses more
+                        // to spills than it gains: on Thor the scene goes from
+                        // 889.9 ms to 911.9 at 168 registers, bit-identically,
+                        // so this stays off. Kept as a knob
+                        // because the trade is a per-board measurement.
+                        if entry.ends_with("fa2_head64_adapter.cu") {
+                            if let Ok(cap) = std::env::var("APXINF_FA2_HEAD64_MAXREG") {
+                                if cap.trim().parse::<u32>().is_ok() {
+                                    cmd.arg(format!("-maxrregcount={}", cap.trim()));
+                                }
+                            }
                         }
                         cmd.arg("-DAPXINF_FA2_SPLITKV=1");
                         // Drop the FlashAttention-2 feature axes the adapter
@@ -709,13 +799,21 @@ fn main() {
                 }
 
                 // Create a static library from all kernel objects
-                let objs: Vec<String> = kernel_files
+                let mut objs: Vec<String> = kernel_files
                     .iter()
                     .map(|e| {
                         let stem = e.file_stem().unwrap().to_string_lossy().to_string();
                         format!("{out_dir}/{stem}.o")
                     })
                     .collect();
+                if let Some(bundle) = &aot_bundle {
+                    objs.extend(
+                        bundle
+                            .kernels
+                            .values()
+                            .map(|kernel| kernel.object.to_string_lossy().into_owned()),
+                    );
+                }
 
                 let lib_path = format!("{out_dir}/libapxinf_kernels.a");
                 // `ar rcs` updates/replaces named members but does not remove
@@ -740,6 +838,9 @@ fn main() {
 
                 println!("cargo:rustc-link-search=native={out_dir}");
                 println!("cargo:rustc-link-lib=static=apxinf_kernels");
+                if let Some(bundle) = &aot_bundle {
+                    bundle.link_runtime(std::path::Path::new(&out_dir));
+                }
                 // Keep CUDA math DSOs after the static archive. GNU ld's
                 // --as-needed otherwise discards cublasLt before it sees the
                 // static inference archive's references.

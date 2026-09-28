@@ -9,8 +9,7 @@
 //! merely shifted but steeper -- 16 is 8% off the optimum on Orin and 26% off
 //! here.
 //!
-//! So they live here: one table, chosen from the device, with a per-field
-//! environment override so a new board can be re-swept without a rebuild. The
+//! So they live here: one table, chosen from the device, without runtime environment overrides. The
 //! adapter does what it is told and asks the driver nothing.
 //!
 //! Re-sweep after changing any of these kernels. The optimum has moved once
@@ -19,22 +18,18 @@
 use crate::device_caps::{CudaArchFamily, CudaDeviceCaps};
 
 /// Which form of a kernel that has a tensor-core implementation to run.
-///
-/// The split forms carry an fp32 operand as two or three BF16 terms so that
-/// every partial product is exact; see the kernels for what each costs against
-/// an fp64 reference.
 pub mod wmma {
     /// The scalar fp32 kernel.
     pub const OFF: i32 = 0;
     /// One BF16 pass: the fp32 operand is rounded.
+    ///
+    /// On the prefill path every operand reaching the chunk-state scan was
+    /// already written through `__float2bfloat16` by the kernel that produced
+    /// it, so this pass is exact there rather than merely close.
     pub const LOSSY: i32 = 1;
-    /// Two BF16 terms, about 2^-16 relative.
-    pub const SPLIT2: i32 = 2;
-    /// Three BF16 terms, about 2^-24, which is fp32's own resolution.
-    pub const SPLIT3: i32 = 3;
 }
 
-/// Launch constants handed to the GDN adapters. Plain `i32` fields in a
+/// Launch constants for the legacy float-input GDN adapters. Plain `i32` fields in a
 /// `#[repr(C)]` struct, so the same declaration serves both sides of the ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,10 +42,6 @@ pub struct GdnLaunchPolicy {
     pub chunk_state_wmma: i32,
     /// Columns accumulated per thread in the chunk-gemm kernel.
     pub chunk_gemm_tile: i32,
-    /// Which form of the chunk GEMM to run; see [`wmma`].
-    pub chunk_gemm_wmma: i32,
-    /// Which form of the raw-attention term to run; see [`wmma`].
-    pub attn_raw_wmma: i32,
     /// Threads per output column in the decode recurrence.
     pub recurrent_split: i32,
     /// How many blocks share one head's chunk-state scan, splitting the value
@@ -70,11 +61,10 @@ pub struct GdnLaunchPolicy {
 }
 
 impl GdnLaunchPolicy {
-    /// The measured defaults for `caps`, then any environment overrides.
+    /// The measured defaults for `caps`.
     pub fn for_device(caps: &CudaDeviceCaps) -> Self {
         let mut policy = Self::defaults_for(caps.arch_family);
         policy.chunk_state_v_split = chunk_state_v_split_for(caps.multiprocessor_count);
-        policy.apply_overrides();
         policy
     }
 
@@ -89,28 +79,24 @@ impl GdnLaunchPolicy {
     /// way, from 1024 back to 512 (5.7645 against 5.7787 over four interleaved
     /// pairs), because the column tile needs fewer registers per thread and the
     /// cap already bought back the residency the wider block was there to
-    /// provide. The tensor-core forms stay off: those kernels need an
-    /// SM100-family tensor core to be worth their extra passes.
+    /// provide. The tensor-core form stays off: that kernel needs an
+    /// SM100-family tensor core to be worth its extra pass.
     ///
     /// sm100 family (Thor sm_110): chunk-state tile 4 rather than 8 and
     /// chunk-gemm tile 4 rather than 32, both re-swept here; the chunk-state
-    /// scan on tensor cores, which is 21.9% of the fixed cost at an operator
-    /// error of 1.422947e-3 against the scalar form's 1.418808e-3; and four
+    /// scan on tensor cores, which is 21.9% of the fixed cost; and four
     /// threads per output column in the decode recurrence, which takes it from
     /// 39.383 to 37.373 ms/token.
     ///
-    /// The other two tensor-core forms are built and measured but default off:
-    /// each is worth under 2% and each moves the end-to-end probe. See their
-    /// kernels for the numbers.
+    /// The tensor-core scan rounds its operands to BF16. The typed BF16
+    /// prefill adapters have fixed launch geometry and do not use this policy.
     pub fn defaults_for(family: CudaArchFamily) -> Self {
         match family {
             CudaArchFamily::Sm100 => Self {
                 chunk_state_tile: 4,
                 chunk_state_threads: 1024,
-                chunk_state_wmma: wmma::SPLIT2,
+                chunk_state_wmma: wmma::LOSSY,
                 chunk_gemm_tile: 4,
-                chunk_gemm_wmma: wmma::OFF,
-                attn_raw_wmma: wmma::OFF,
                 recurrent_split: 4,
                 chunk_state_v_split: 1,
             },
@@ -119,35 +105,10 @@ impl GdnLaunchPolicy {
                 chunk_state_threads: 512,
                 chunk_state_wmma: wmma::OFF,
                 chunk_gemm_tile: 8,
-                chunk_gemm_wmma: wmma::OFF,
-                attn_raw_wmma: wmma::OFF,
                 recurrent_split: 1,
                 chunk_state_v_split: 1,
             },
         }
-    }
-
-    fn apply_overrides(&mut self) {
-        override_from("APXINF_GDN_CHUNK_TILE", &mut self.chunk_state_tile, &[1, 2, 4, 8, 16]);
-        override_from(
-            "APXINF_GDN_CHUNK_STATE_THREADS",
-            &mut self.chunk_state_threads,
-            &[128, 256, 512, 1024],
-        );
-        override_wmma("APXINF_GDN_CHUNK_STATE_WMMA", &mut self.chunk_state_wmma);
-        override_from(
-            "APXINF_GDN_CHUNK_GEMM_TILE",
-            &mut self.chunk_gemm_tile,
-            &[1, 2, 4, 8, 16, 32],
-        );
-        override_wmma("APXINF_GDN_CHUNK_GEMM_WMMA", &mut self.chunk_gemm_wmma);
-        override_wmma("APXINF_GDN_ATTN_RAW_WMMA", &mut self.attn_raw_wmma);
-        override_from("APXINF_GDN_RECURRENT_SPLIT", &mut self.recurrent_split, &[1, 2, 4]);
-        override_from(
-            "APXINF_GDN_CHUNK_STATE_V_SPLIT",
-            &mut self.chunk_state_v_split,
-            &[1, 2, 4, 8],
-        );
     }
 }
 
@@ -173,30 +134,6 @@ fn chunk_state_v_split_for(multiprocessor_count: u32) -> i32 {
     }
 }
 
-/// Accept only values the kernels are instantiated for; anything else is
-/// ignored rather than passed through to a launch that would fail.
-fn override_from(name: &str, slot: &mut i32, allowed: &[i32]) {
-    if let Some(value) = std::env::var(name).ok().and_then(|v| v.trim().parse::<i32>().ok()) {
-        if allowed.contains(&value) {
-            *slot = value;
-        }
-    }
-}
-
-/// `0`/`off`/`false` for the scalar kernel, `lossy` for one BF16 pass, or the
-/// number of BF16 terms.
-fn override_wmma(name: &str, slot: &mut i32) {
-    let Ok(raw) = std::env::var(name) else { return };
-    let value = raw.trim();
-    *slot = match value {
-        "0" | "off" | "false" => wmma::OFF,
-        "lossy" | "1" => wmma::LOSSY,
-        "2" => wmma::SPLIT2,
-        "3" | "on" | "true" => wmma::SPLIT3,
-        _ => return,
-    };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,10 +144,13 @@ mod tests {
         let orin = GdnLaunchPolicy::defaults_for(CudaArchFamily::Sm80);
         assert_eq!((thor.chunk_state_tile, thor.chunk_gemm_tile), (4, 4));
         assert_eq!((orin.chunk_state_tile, orin.chunk_gemm_tile), (8, 8));
-        assert_eq!((thor.chunk_state_threads, orin.chunk_state_threads), (1024, 512));
+        assert_eq!(
+            (thor.chunk_state_threads, orin.chunk_state_threads),
+            (1024, 512)
+        );
         assert_eq!(thor.recurrent_split, 4);
         assert_eq!(orin.recurrent_split, 1);
-        assert_eq!(thor.chunk_state_wmma, wmma::SPLIT2);
+        assert_eq!(thor.chunk_state_wmma, wmma::LOSSY);
         assert_eq!(orin.chunk_state_wmma, wmma::OFF);
     }
 
@@ -220,16 +160,6 @@ mod tests {
             GdnLaunchPolicy::defaults_for(CudaArchFamily::Other(75)),
             GdnLaunchPolicy::defaults_for(CudaArchFamily::Sm80)
         );
-    }
-
-    #[test]
-    fn overrides_reject_values_the_kernels_are_not_instantiated_for() {
-        let mut tile = 4;
-        override_from("APXINF_GDN_TEST_UNSET", &mut tile, &[1, 2, 4]);
-        assert_eq!(tile, 4);
-        let mut mode = wmma::OFF;
-        override_wmma("APXINF_GDN_TEST_UNSET", &mut mode);
-        assert_eq!(mode, wmma::OFF);
     }
 
     #[test]

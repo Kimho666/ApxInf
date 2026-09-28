@@ -22,6 +22,16 @@ use crate::test_util::{
     upload_fp32_as_bf16,
 };
 
+fn bf16_buffer(ctx: &CudaContext, values: &[f32]) -> CudaBuffer {
+    CudaBuffer::from_tensor(&upload_fp32_as_bf16(ctx, values, vec![values.len()]).unwrap()).unwrap()
+}
+
+fn round_bf16(values: &mut [f32]) {
+    for value in values {
+        *value = half::bf16::from_f32(*value).to_f32();
+    }
+}
+
 fn silu_ref(x: f32) -> f32 {
     x / (1.0f32 + (-x).exp())
 }
@@ -79,6 +89,80 @@ fn sdpa_fa2_prefill_supports_direct_output_projection() {
         assert!(actual.iter().all(|x| x.is_finite()));
         assert_bf16_close_reduction(&actual, &expected);
     }
+}
+
+#[test]
+fn gr00t_hdim96_bm64_gate_is_exact_and_falls_back() {
+    use crate::kernels::attention::noncausal_hdim96_bm64_shape_supported as supported;
+
+    assert!(supported(8, 7, 41, 28, 32, 48));
+    assert!(supported(8, 7, 41, 41, 32, 48));
+    assert!(supported(8, 7, 41, 128, 32, 48));
+    assert!(supported(11, 0, 41, 41, 32, 48));
+    assert!(!supported(8, 7, 40, 41, 32, 48));
+    assert!(!supported(8, 7, 41, 42, 32, 48));
+    assert!(!supported(8, 9, 41, 41, 32, 48));
+    assert!(!supported(11, 1, 41, 41, 32, 48));
+}
+
+#[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+#[test]
+fn gr00t_hdim96_bm64_matches_default_fa2_bitwise() {
+    let _guard = super::gpu_smem_guard();
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    if !matches!(ctx.caps().sm, 87 | 110) {
+        return;
+    }
+    const QUERY: usize = 41;
+    const HEADS: usize = 32;
+    const DIM: usize = 48;
+    let values = |count: usize, phase: f32| {
+        (0..count)
+            .map(|index| ((index as f32 * 0.013 + phase).sin()) * 0.2)
+            .collect::<Vec<_>>()
+    };
+    let q_count = QUERY * HEADS * DIM;
+    let q = upload_fp32_as_bf16(&ctx, &values(q_count, 0.1), vec![QUERY, HEADS, DIM]).unwrap();
+    for key_tokens in [28, 41, 128] {
+        let kv_count = key_tokens * HEADS * DIM;
+        let k = upload_fp32_as_bf16(&ctx, &values(kv_count, 0.3), vec![key_tokens, HEADS, DIM])
+            .unwrap();
+        let v = upload_fp32_as_bf16(&ctx, &values(kv_count, 0.5), vec![key_tokens, HEADS, DIM])
+            .unwrap();
+        let reference = crate::kernels::attention::noncausal(&ctx, &q, &k, &v, HEADS, DIM).unwrap();
+        let candidate =
+            crate::kernels::attention::noncausal_hdim96_bm64(&ctx, &q, &k, &v, HEADS, DIM)
+                .unwrap()
+                .expect("measured GR00T production shape must select BM64");
+        assert_eq!(
+            candidate.shape(),
+            reference.shape(),
+            "key_tokens={key_tokens}"
+        );
+        assert_eq!(
+            download_bf16_as_fp32(&reference).unwrap(),
+            download_bf16_as_fp32(&candidate).unwrap(),
+            "key_tokens={key_tokens}"
+        );
+    }
+
+    let qkv = upload_fp32_as_bf16(
+        &ctx,
+        &values(QUERY * 3 * HEADS * DIM, 0.7),
+        vec![QUERY, 3 * HEADS * DIM],
+    )
+    .unwrap();
+    let reference =
+        crate::kernels::attention::noncausal_strided_qkv(&ctx, &qkv, HEADS, DIM).unwrap();
+    let candidate =
+        crate::kernels::attention::noncausal_strided_qkv_hdim96_bm64(&ctx, &qkv, HEADS, DIM)
+            .unwrap()
+            .expect("measured GR00T production strided shape must select BM64");
+    assert_eq!(candidate.shape(), reference.shape());
+    assert_eq!(
+        download_bf16_as_fp32(&reference).unwrap(),
+        download_bf16_as_fp32(&candidate).unwrap()
+    );
 }
 
 #[test]
@@ -621,8 +705,9 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
     // above, so the oracle has to start from those, not from the fp32 draws.
     let to_bf16 = |x: f32| -> f64 {
         let bits = x.to_bits();
-        let rounded = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32
-            | ((bits >> 16) & 1)))) << 16;
+        let rounded = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(rounded) as f64
     };
 
@@ -639,7 +724,14 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
     }
 
     let out = crate::kernels::attention::segmented_mha_bf16(
-        &ctx, &q, &k, &v, &offsets, &host_offsets, segments, seg_tokens,
+        &ctx,
+        &q,
+        &k,
+        &v,
+        &offsets,
+        &host_offsets,
+        segments,
+        seg_tokens,
     )
     .unwrap();
     let got = download_bf16_as_fp32(&out).unwrap();
@@ -726,7 +818,6 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
 // double-precision reference of the same recurrence.
 //
 //   cargo test --release -p apxinf-cuda gdn_recurrent_decode -- --nocapture
-//   APXINF_GDN_RECURRENT_SPLIT=1 cargo test ...   (the scalar kernel)
 #[test]
 fn gdn_recurrent_decode_error_against_fp64_oracle() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
@@ -753,7 +844,8 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
         .enumerate()
         .map(|(i, x)| x * (2.0f32).powi(((i % kdim) as i32 - 64) / 8))
         .collect();
-    let v = draw(33, heads * vdim, 1.0);
+    let mut v = draw(33, heads * vdim, 1.0);
+    round_bf16(&mut v);
     let beta = draw(44, heads, 0.5);
     // g is a log-decay: keep it negative so exp(g) is a contraction.
     let g: Vec<f32> = draw(55, heads, 0.5).iter().map(|x| -x.abs()).collect();
@@ -772,18 +864,34 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
         }
         buf
     };
-    let (qb, kb, vb, bb, gb) = (upload(&q), upload(&k), upload(&v), upload(&beta), upload(&g));
+    let (qb, kb, vb, bb, gb) = (
+        upload(&q),
+        upload(&k),
+        bf16_buffer(&ctx, &v),
+        upload(&beta),
+        upload(&g),
+    );
     let sb = upload(&state0);
     let out = CudaBuffer::alloc(heads * vdim * 2, 0).unwrap();
 
     crate::kernels::linear_attention::gdn_recurrent(
-        &ctx, &qb, &kb, &vb, &bb, &gb, &sb,
-        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16).unwrap(),
-        heads, kdim, vdim,
+        &ctx,
+        &qb,
+        &kb,
+        &vb,
+        &bb,
+        &gb,
+        &sb,
+        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16)
+            .unwrap(),
+        heads,
+        kdim,
+        vdim,
     )
     .unwrap();
     let got = download_bf16_as_fp32(
-        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16).unwrap(),
+        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16)
+            .unwrap(),
     )
     .unwrap();
 
@@ -815,7 +923,7 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
             worst = worst.max(delta_abs / acc.abs().max(1e-6));
         }
     }
-    let split = std::env::var("APXINF_GDN_RECURRENT_SPLIT").unwrap_or_else(|_| "default".into());
+    let split = crate::kernels::gdn_policy::GdnLaunchPolicy::for_device(ctx.caps()).recurrent_split;
     println!(
         "gdn_recurrent_oracle split={split} elements={} mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
         heads * vdim,
@@ -847,7 +955,19 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
 //
 //   cargo test --release -p apxinf-cuda gdn_chunk_state_scan -- --nocapture
 #[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
 fn gdn_chunk_state_scan_error_against_fp64_oracle() {
+    chunk_state_fp64_oracle(false);
+}
+
+#[test]
+#[ignore = "requires CUDA with at least 144 KiB shared memory per block"]
+fn gdn_chunk_state_bf16_ptx_matches_fp64_oracle() {
+    chunk_state_fp64_oracle(true);
+}
+
+fn chunk_state_fp64_oracle(typed_bf16: bool) {
+    let _guard = super::gpu_smem_guard();
     let ctx = CudaContext::new(0).expect("CUDA device required");
     let (heads, kdim, vdim, chunk, chunks) = (4usize, 128usize, 128usize, 64usize, 3usize);
     let seq_pad = chunk * chunks;
@@ -864,11 +984,18 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
             })
             .collect()
     };
-    let q = draw(1, heads * seq_pad * kdim, 0.5);
-    let k = draw(2, heads * seq_pad * kdim, 0.5);
-    let t = draw(3, heads * chunks * chunk * chunk, 0.25);
-    let vt = draw(4, heads * chunks * chunk * vdim, 0.5);
-    let kcd = draw(5, heads * chunks * chunk * kdim, 0.25);
+    let mut q = draw(1, heads * seq_pad * kdim, 0.5);
+    let mut k = draw(2, heads * seq_pad * kdim, 0.5);
+    let mut t = draw(3, heads * chunks * chunk * chunk, 0.25);
+    let mut vt = draw(4, heads * chunks * chunk * vdim, 0.5);
+    let mut kcd = draw(5, heads * chunks * chunk * kdim, 0.25);
+    for values in [&mut t, &mut vt, &mut kcd] {
+        round_bf16(values);
+    }
+    if typed_bf16 {
+        round_bf16(&mut q);
+        round_bf16(&mut k);
+    }
     let state0 = draw(6, heads * kdim * vdim, 0.2);
     // g_cum is a cumulative log-decay: non-increasing within a chunk.
     let mut g_cum = vec![0.0f32; heads * seq_pad];
@@ -895,15 +1022,42 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
         }
         buf
     };
+    let upload_operand = |data: &[f32]| -> CudaBuffer {
+        if !typed_bf16 {
+            return upload(data);
+        }
+        let values: Vec<half::bf16> = data.iter().map(|v| half::bf16::from_f32(*v)).collect();
+        let buf = CudaBuffer::alloc(values.len() * 2, 0).unwrap();
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
+                buf.ptr(),
+                values.as_ptr().cast(),
+                values.len() * 2,
+                crate::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))
+            .unwrap();
+        }
+        buf
+    };
     let (qb, kb, gb, tb, vtb, kcdb) = (
-        upload(&q), upload(&k), upload(&g_cum), upload(&t), upload(&vt), upload(&kcd),
+        upload_operand(&q),
+        upload_operand(&k),
+        upload(&g_cum),
+        bf16_buffer(&ctx, &t),
+        bf16_buffer(&ctx, &vt),
+        bf16_buffer(&ctx, &kcd),
     );
     let sb = upload(&state0);
     let out = CudaBuffer::alloc(seq * heads * vdim * 2, 0).unwrap();
     let out_t = out
         .as_tensor(Shape::new(vec![seq, heads * vdim]), DType::BF16)
         .unwrap();
-    crate::kernels::linear_attention::gdn_chunk_state(
+    let launch = if typed_bf16 {
+        crate::kernels::linear_attention::gdn_chunk_state_qk_bf16
+    } else {
+        crate::kernels::linear_attention::gdn_chunk_state
+    };
+    launch(
         &ctx, &qb, &kb, &gb, &tb, &vtb, &kcdb, &sb, &out_t, seq_pad, heads, kdim, vdim, chunk,
     )
     .unwrap();
@@ -915,7 +1069,9 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
     let bf = |x: f64| -> f64 {
         let v = x as f32;
         let bits = v.to_bits();
-        let r = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1)))) << 16;
+        let r = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(r) as f64
     };
     let scale = 1.0f64 / (kdim as f64).sqrt();
@@ -982,15 +1138,15 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
         }
     }
     println!(
-        "gdn_chunk_state_oracle tile={} elements={} mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
-        std::env::var("APXINF_GDN_CHUNK_TILE").unwrap_or_else(|_| "default".into()),
+        "gdn_chunk_state_oracle typed_bf16={} elements={} mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
+        typed_bf16,
         seq * heads * vdim,
         sum_abs / (seq * heads * vdim) as f64,
         sum_abs / sum_ref,
         worst
     );
     assert!(
-        sum_abs / sum_ref < 0.05,
+        sum_abs / sum_ref < if typed_bf16 { 0.01 } else { 0.05 },
         "GDN chunk-state relative L1 {} against fp64",
         sum_abs / sum_ref
     );
@@ -1007,6 +1163,7 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
 //
 //   cargo test --release -p apxinf-cuda gdn_chunk_state_v_split -- --nocapture
 #[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
 fn gdn_chunk_state_v_split_is_bit_exact() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
     let (heads, kdim, vdim, chunk, chunks) = (4usize, 128usize, 128usize, 64usize, 3usize);
@@ -1055,22 +1212,48 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
         buf
     };
     let (qb, kb, gb, tb, vtb, kcdb) = (
-        upload(&q), upload(&k), upload(&g_cum), upload(&t), upload(&vt), upload(&kcd),
+        upload(&q),
+        upload(&k),
+        upload(&g_cum),
+        upload(&t),
+        upload(&vt),
+        upload(&kcd),
     );
 
     // The scan carries its state in the buffer it was given, so each run needs
     // its own copy of the initial state to start from.
-    let run = |split: &str| -> (Vec<f32>, Vec<f32>) {
-        std::env::set_var("APXINF_GDN_CHUNK_STATE_V_SPLIT", split);
+    let run = |split: i32| -> (Vec<f32>, Vec<f32>) {
+        let mut policy = crate::kernels::gdn_policy::GdnLaunchPolicy::for_device(ctx.caps());
+        policy.chunk_state_wmma = crate::kernels::gdn_policy::wmma::OFF;
+        policy.chunk_state_v_split = split;
         let sb = upload(&state0);
         let out = CudaBuffer::alloc(seq * heads * vdim * 2, 0).unwrap();
         let out_t = out
             .as_tensor(Shape::new(vec![seq, heads * vdim]), DType::BF16)
             .unwrap();
-        crate::kernels::linear_attention::gdn_chunk_state(
-            &ctx, &qb, &kb, &gb, &tb, &vtb, &kcdb, &sb, &out_t, seq_pad, heads, kdim, vdim, chunk,
-        )
-        .unwrap();
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::apxinf_static_gdn_chunk_state_f32(
+                qb.ptr(),
+                kb.ptr(),
+                gb.ptr(),
+                tb.ptr(),
+                vtb.ptr(),
+                kcdb.ptr(),
+                sb.ptr(),
+                out.ptr(),
+                seq as i32,
+                seq_pad as i32,
+                heads as i32,
+                kdim as i32,
+                vdim as i32,
+                chunk as i32,
+                chunks as i32,
+                (heads * vdim) as i32,
+                &policy,
+                ctx.stream().handle(),
+            ))
+            .unwrap();
+        }
         let produced = download_bf16_as_fp32(&out_t).unwrap();
         let mut state = vec![0.0f32; heads * kdim * vdim];
         unsafe {
@@ -1085,8 +1268,8 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
         (produced, state)
     };
 
-    let (base_out, base_state) = run("1");
-    for split in ["2", "4"] {
+    let (base_out, base_state) = run(1);
+    for split in [2, 4] {
         let (split_out, split_state) = run(split);
         let out_diff = base_out
             .iter()
@@ -1103,9 +1286,11 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
             base_out.len()
         );
         assert_eq!(out_diff, 0, "value split {split} changed the output");
-        assert_eq!(state_diff, 0, "value split {split} changed the carried state");
+        assert_eq!(
+            state_diff, 0,
+            "value split {split} changed the carried state"
+        );
     }
-    std::env::remove_var("APXINF_GDN_CHUNK_STATE_V_SPLIT");
 }
 
 // ── GDN chunk GEMM against an fp64 oracle ─────────────────────────
@@ -1117,7 +1302,6 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
 // measured is only what the multiply does.
 //
 //   cargo test --release -p apxinf-cuda gdn_chunk_gemm_error -- --nocapture
-//   APXINF_GDN_CHUNK_STATE_WMMA=0 / lossy for the other two forms
 #[test]
 fn gdn_chunk_gemm_error_against_fp64_oracle() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
@@ -1135,7 +1319,8 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
             .collect()
     };
     let a = draw(7, heads * chunks * chunk * chunk, 0.3);
-    let v = draw(8, heads * seq_pad * vdim, 0.6);
+    let mut v = draw(8, heads * seq_pad * vdim, 0.6);
+    round_bf16(&mut v);
     let k = draw(9, heads * seq_pad * kdim, 0.6);
     let beta = draw(10, heads * seq_pad, 0.5);
     let mut g_cum = vec![0.0f32; heads * seq_pad];
@@ -1161,17 +1346,23 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
         }
         b
     };
-    let (ab, vb, kb, bb, gb) = (upload(&a), upload(&v), upload(&k), upload(&beta), upload(&g_cum));
+    let (ab, vb, kb, bb, gb) = (
+        upload(&a),
+        bf16_buffer(&ctx, &v),
+        upload(&k),
+        upload(&beta),
+        upload(&g_cum),
+    );
     let n_vt = heads * chunks * chunk * vdim;
     let n_kcd = heads * chunks * chunk * kdim;
-    let vt = CudaBuffer::alloc(n_vt * 4, 0).unwrap();
-    let kcd = CudaBuffer::alloc(n_kcd * 4, 0).unwrap();
+    let vt = CudaBuffer::alloc(n_vt * 2, 0).unwrap();
+    let kcd = CudaBuffer::alloc(n_kcd * 2, 0).unwrap();
     crate::kernels::linear_attention::gdn_chunk_gemm(
         &ctx, &ab, &vb, &kb, &bb, &gb, &vt, &kcd, seq_pad, heads, kdim, vdim, chunk,
     )
     .unwrap();
     let read = |b: &CudaBuffer, n: usize| -> Vec<f32> {
-        crate::transfers::to_cpu(&b.as_tensor(Shape::new(vec![1, n]), DType::F32).unwrap())
+        crate::transfers::to_cpu(&b.as_tensor(Shape::new(vec![1, n]), DType::BF16).unwrap())
             .unwrap()
             .to_f32_vec()
             .unwrap()
@@ -1182,7 +1373,9 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
     let bf = |x: f64| -> f64 {
         let f = x as f32;
         let bits = f.to_bits();
-        let r = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1)))) << 16;
+        let r = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(r) as f64
     };
     let mut sum_abs = 0.0f64;
@@ -1215,7 +1408,7 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
     }
     println!(
         "gdn_chunk_gemm_oracle mode={} elements={} rel_l1={:.6e}",
-        std::env::var("APXINF_GDN_CHUNK_STATE_WMMA").unwrap_or_else(|_| "default".into()),
+        crate::kernels::gdn_policy::GdnLaunchPolicy::for_device(ctx.caps()).chunk_state_wmma,
         2 * n_vt,
         sum_abs / sum_ref
     );
@@ -1697,6 +1890,138 @@ fn layer_norm_bf16_matches_fp32_reference() {
 }
 
 #[test]
+fn cached_residual_layer_norm_1024_is_bitwise_exact() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (3usize, 1024usize);
+    let projection: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let residual: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let projection_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.0001 - 0.05).collect();
+    let norm_weight: Vec<f32> = (0..cols).map(|i| 0.9 + (i as f32) * 0.0001).collect();
+    let norm_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.00002).collect();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let projection_bias = upload_fp32_as_bf16(&ctx, &projection_bias, vec![cols]).unwrap();
+    let norm_weight = upload_fp32_as_bf16(&ctx, &norm_weight, vec![cols]).unwrap();
+    let norm_bias = upload_fp32_as_bf16(&ctx, &norm_bias, vec![cols]).unwrap();
+    let legacy = crate::kernels::fused::bias_residual_layer_bf16(
+        &ctx,
+        &projection,
+        Some(&projection_bias),
+        &residual,
+        &norm_weight,
+        &norm_bias,
+        1.0e-6,
+    )
+    .unwrap();
+    let cached = crate::kernels::fused::bias_residual_layer_bf16_cached_1024(
+        &ctx,
+        &projection,
+        Some(&projection_bias),
+        &residual,
+        &norm_weight,
+        &norm_bias,
+        1.0e-6,
+    )
+    .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&legacy.hidden).unwrap(),
+        download_bf16_as_fp32(&cached.hidden).unwrap()
+    );
+    assert_eq!(
+        download_bf16_as_fp32(&legacy.normalized).unwrap(),
+        download_bf16_as_fp32(&cached.normalized).unwrap()
+    );
+}
+
+#[test]
+fn cached_bias_then_residual_adaptive_layer_norm_1536_is_bitwise_exact() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (41usize, 1536usize);
+    let projection: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let residual: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let projection_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.0001 - 0.05).collect();
+    let modulation: Vec<f32> = (0..2 * cols)
+        .map(|i| ((i as f32) * 0.0003).sin() * 0.25)
+        .collect();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let projection_bias = upload_fp32_as_bf16(&ctx, &projection_bias, vec![cols]).unwrap();
+    let modulation = upload_fp32_as_bf16(&ctx, &modulation, vec![2 * cols]).unwrap();
+    let biased =
+        crate::kernels::elementwise::bias_bf16(&ctx, &projection, Some(&projection_bias)).unwrap();
+    let legacy_hidden = add(&ctx, &biased, &residual).unwrap();
+    let legacy_normalized =
+        crate::kernels::norm::adaptive_layer(&ctx, &legacy_hidden, &modulation, 1.0e-6).unwrap();
+    let cached = crate::kernels::fused::bias_then_residual_adaptive_layer_bf16_cached_1536(
+        &ctx,
+        &projection,
+        &projection_bias,
+        &residual,
+        &modulation,
+        1.0e-6,
+    )
+    .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_hidden).unwrap(),
+        download_bf16_as_fp32(&cached.hidden).unwrap()
+    );
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_normalized).unwrap(),
+        download_bf16_as_fp32(&cached.normalized).unwrap()
+    );
+}
+
+#[test]
+fn cached_bias_then_residual_layer_norm_1536_is_bitwise_exact() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (3usize, 1536usize);
+    let projection: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let residual: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let projection_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.0001 - 0.05).collect();
+    let norm_weight: Vec<f32> = (0..cols).map(|i| 0.9 + (i as f32) * 0.0001).collect();
+    let norm_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.00002).collect();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let projection_bias = upload_fp32_as_bf16(&ctx, &projection_bias, vec![cols]).unwrap();
+    let norm_weight = upload_fp32_as_bf16(&ctx, &norm_weight, vec![cols]).unwrap();
+    let norm_bias = upload_fp32_as_bf16(&ctx, &norm_bias, vec![cols]).unwrap();
+    let biased =
+        crate::kernels::elementwise::bias_bf16(&ctx, &projection, Some(&projection_bias)).unwrap();
+    let legacy_hidden = add(&ctx, &biased, &residual).unwrap();
+    let legacy_normalized = layer(&ctx, &legacy_hidden, &norm_weight, &norm_bias, 1.0e-6).unwrap();
+    let cached = crate::kernels::fused::bias_then_residual_layer_bf16_cached_1536(
+        &ctx,
+        &projection,
+        &projection_bias,
+        &residual,
+        &norm_weight,
+        &norm_bias,
+        1.0e-6,
+    )
+    .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_hidden).unwrap(),
+        download_bf16_as_fp32(&cached.hidden).unwrap()
+    );
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_normalized).unwrap(),
+        download_bf16_as_fp32(&cached.normalized).unwrap()
+    );
+}
+
+#[test]
 fn gelu_tanh_bf16_matches_fp32_reference() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
     let input: Vec<f32> = (0..65).map(|i| -4.0 + (i as f32) * 0.125).collect();
@@ -1730,6 +2055,73 @@ fn add_bias_bf16_matches_fp32_reference() {
     let t_b = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
     let out = add_bias(&ctx, &t_in, &t_b).unwrap();
     assert_bf16_close_elementwise(&download_bf16_as_fp32(&out).unwrap(), &expected);
+}
+
+#[test]
+fn packed_bias_then_residual_bf16_matches_common_path_bitwise() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    for (rows, cols) in [(41, 1536), (156, 2048), (512, 1024)] {
+        let projection = (0..rows * cols)
+            .map(|index| ((index * 17 % 257) as f32 - 128.0) / 64.0)
+            .collect::<Vec<_>>();
+        let residual = (0..rows * cols)
+            .map(|index| ((index * 29 % 263) as f32 - 131.0) / 128.0)
+            .collect::<Vec<_>>();
+        let bias = (0..cols)
+            .map(|index| ((index * 13 % 251) as f32 - 125.0) / 256.0)
+            .collect::<Vec<_>>();
+        let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+        let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+        let bias = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
+        let common = crate::kernels::fused::bias_then_residual_bf16(
+            &ctx,
+            &projection,
+            Some(&bias),
+            &residual,
+        )
+        .unwrap();
+        let packed = crate::kernels::fused::bias_then_residual_bf16_packed4(
+            &ctx,
+            &projection,
+            Some(&bias),
+            &residual,
+        )
+        .unwrap();
+        assert_eq!(
+            download_bf16_as_fp32(&packed).unwrap(),
+            download_bf16_as_fp32(&common).unwrap(),
+            "packed4 mismatch for {rows}x{cols}"
+        );
+    }
+}
+
+#[test]
+fn packed_bias_residual_bf16_matches_common_path_bitwise() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (512usize, 1024usize);
+    let projection = (0..rows * cols)
+        .map(|index| ((index * 17 % 257) as f32 - 128.0) / 64.0)
+        .collect::<Vec<_>>();
+    let residual = (0..rows * cols)
+        .map(|index| ((index * 29 % 263) as f32 - 131.0) / 128.0)
+        .collect::<Vec<_>>();
+    let bias = (0..cols)
+        .map(|index| ((index * 13 % 251) as f32 - 125.0) / 256.0)
+        .collect::<Vec<_>>();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let bias = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
+    let common =
+        crate::kernels::fused::bias_residual_bf16(&ctx, &projection, Some(&bias), &residual)
+            .unwrap();
+    let packed =
+        crate::kernels::fused::bias_residual_bf16_packed4(&ctx, &projection, &bias, &residual)
+            .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&packed).unwrap(),
+        download_bf16_as_fp32(&common).unwrap(),
+        "packed4 single-rounding bias residual mismatch"
+    );
 }
 
 // ── Vision 2D-RoPE ───────────────────────────────────────────────
@@ -1927,4 +2319,295 @@ fn concat_2d_bf16_packs_gate_up_correctly() {
         }
     }
     assert_bf16_close_elementwise(&out, &expected);
+}
+
+/// The fused contract must retain all unit-offset and BF16 rounding boundaries,
+/// including the vector reduction used by planner-sized matrices.
+#[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
+fn weighted_adaln_residual_fusion_matches_composition() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    for (rows, cols) in [
+        (1, 7),
+        (3, 129),
+        (15, 256),
+        (16, 256),
+        (50, 1024),
+        (2, 8192),
+    ] {
+        for amplitude in [0.0, 0.3, 10.0] {
+            let matrix = |phase: f32| {
+                let data: Vec<f32> = (0..rows * cols)
+                    .map(|i| ((i as f32) * 0.13 + phase).sin() * amplitude)
+                    .collect();
+                upload_fp32_as_bf16(&ctx, &data, vec![rows, cols]).unwrap()
+            };
+            let vector = |phase: f32| {
+                let data: Vec<f32> = (0..cols)
+                    .map(|i| ((i as f32) * 0.17 + phase).cos())
+                    .collect();
+                upload_fp32_as_bf16(&ctx, &data, vec![cols]).unwrap()
+            };
+            let (projection, residual) = (matrix(0.1), matrix(0.9));
+            let (gate, weight, scale, shift) = (vector(0.2), vector(0.7), vector(1.2), vector(1.7));
+            let expected_hidden = crate::kernels::linear_attention::adaln_gate_residual(
+                &ctx,
+                &projection,
+                &residual,
+                &gate,
+            )
+            .unwrap();
+            let expected_norm = crate::kernels::linear_attention::adaln_rms_norm(
+                &ctx,
+                &expected_hidden,
+                &weight,
+                &scale,
+                &shift,
+                1e-6,
+            )
+            .unwrap();
+            let actual = crate::kernels::fused::adaln_gate_residual_rms_bf16(
+                &ctx,
+                &projection,
+                &residual,
+                &gate,
+                &weight,
+                &scale,
+                &shift,
+                1e-6,
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                download_bf16_as_fp32(&actual.hidden).unwrap(),
+                download_bf16_as_fp32(&expected_hidden).unwrap(),
+                "hidden {rows}x{cols}"
+            );
+            assert_eq!(
+                download_bf16_as_fp32(&actual.normalized).unwrap(),
+                download_bf16_as_fp32(&expected_norm).unwrap(),
+                "norm {rows}x{cols}"
+            );
+        }
+    }
+}
+
+// The causal conv stages a window of tokens in shared memory so each input is
+// read once instead of kernel_size times. The shapes that can break that are
+// the ones where the window is not a whole tile: a sequence that straddles the
+// CONV_TOKENS boundary, one shorter than a tile, and the single-token decode
+// that carries its left context entirely in the cached state. The reference
+// below is the per-token form the kernel replaced, rounding where it rounded.
+#[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
+fn causal_conv_tiling_matches_the_per_token_reference() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let draw = |salt: u64, n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+                x ^= x >> 32;
+                half::bf16::from_f32(((x & 0xFFFF) as f32 / 32768.0 - 1.0) * scale).to_f32()
+            })
+            .collect()
+    };
+    // 70 straddles the 32-token tile, 5 is shorter than one, 1 is decode, and
+    // 64 lands exactly on a tile edge. 300 channels crosses the 256-wide slab.
+    for &seq in &[70usize, 5, 1, 64] {
+        for &cached in &[false, true] {
+            let (channels, kernel_size) = (300usize, 4usize);
+            let x_stride = channels + 37; // the real caller passes a wider row
+            let x = draw(1, seq * x_stride, 0.8);
+            let weight = draw(2, channels * kernel_size, 0.5);
+            let state = draw(3, channels * kernel_size, 0.7);
+
+            let mut expected = vec![0.0f32; seq * channels];
+            for token in 0..seq {
+                for channel in 0..channels {
+                    let mut acc = 0.0f32;
+                    for i in 0..kernel_size {
+                        let src = token as isize - (kernel_size as isize - 1) + i as isize;
+                        let value = if src >= 0 {
+                            x[src as usize * x_stride + channel]
+                        } else if cached {
+                            state[channel * kernel_size + (kernel_size as isize + src) as usize]
+                        } else {
+                            0.0
+                        };
+                        acc += value * weight[channel * kernel_size + i];
+                    }
+                    let conv = half::bf16::from_f32(acc).to_f32();
+                    expected[token * channels + channel] =
+                        half::bf16::from_f32(silu_ref(conv)).to_f32();
+                }
+            }
+
+            let xt = upload_fp32_as_bf16(&ctx, &x, vec![seq, x_stride]).unwrap();
+            let wt = upload_fp32_as_bf16(&ctx, &weight, vec![channels, kernel_size]).unwrap();
+            let st = upload_fp32_as_bf16(&ctx, &state, vec![channels, kernel_size]).unwrap();
+            let out =
+                upload_fp32_as_bf16(&ctx, &vec![0.0; seq * channels], vec![seq, channels]).unwrap();
+            let new_state = upload_fp32_as_bf16(
+                &ctx,
+                &vec![0.0; channels * kernel_size],
+                vec![channels, kernel_size],
+            )
+            .unwrap();
+            crate::kernels::linear_attention::causal_conv1d_silu_bf16(
+                &ctx,
+                &xt,
+                &wt,
+                if cached { Some(&st) } else { None },
+                &out,
+                &new_state,
+                kernel_size,
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                download_bf16_as_fp32(&out).unwrap(),
+                expected,
+                "seq={seq} cached={cached}"
+            );
+
+            // The cache handoff: the last kernel_size pre-conv activations.
+            let mut expected_state = vec![0.0f32; channels * kernel_size];
+            for channel in 0..channels {
+                for i in 0..kernel_size {
+                    expected_state[channel * kernel_size + i] = if seq + i < kernel_size {
+                        if cached {
+                            state[channel * kernel_size + seq + i]
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        x[(seq + i - kernel_size) * x_stride + channel]
+                    };
+                }
+            }
+            assert_eq!(
+                download_bf16_as_fp32(&new_state).unwrap(),
+                expected_state,
+                "new_state seq={seq} cached={cached}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
+fn pillow_axis_rejects_inconsistent_orthogonal_extent() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let buffer = CudaBuffer::alloc(64, 0).unwrap();
+    for (horizontal, out_w, out_h) in [(true, 2, 3), (false, 3, 2)] {
+        let status = unsafe {
+            crate::ffi::apxinf_pillow_bicubic_u8_axis(
+                buffer.ptr(),
+                buffer.ptr(),
+                buffer.ptr(),
+                buffer.ptr(),
+                buffer.ptr(),
+                buffer.ptr(),
+                1,
+                2,
+                2,
+                out_w,
+                out_h,
+                1,
+                horizontal,
+                ctx.stream().handle(),
+            )
+        };
+        assert_eq!(
+            status, 1,
+            "geometry must be rejected before a kernel launch"
+        );
+    }
+    ctx.synchronize().unwrap();
+}
+
+#[test]
+fn layer_norm_quantize_w8a8_matches_separate_kernels_bitwise() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, cols) = (41usize, 1536usize);
+    let eps = 1e-5f32;
+    let input = (0..rows * cols)
+        .map(|index| ((index * 17 % 509) as f32 - 254.0) / 128.0)
+        .collect::<Vec<_>>();
+    let weight = (0..cols)
+        .map(|index| 1.0 + ((index * 13 % 127) as f32 - 63.0) / 512.0)
+        .collect::<Vec<_>>();
+    let bias = (0..cols)
+        .map(|index| ((index * 29 % 251) as f32 - 125.0) / 1024.0)
+        .collect::<Vec<_>>();
+    let input = upload_fp32_as_bf16(&ctx, &input, vec![rows, cols]).unwrap();
+    let weight = upload_fp32_as_bf16(&ctx, &weight, vec![cols]).unwrap();
+    let bias = upload_fp32_as_bf16(&ctx, &bias, vec![cols]).unwrap();
+    let separate_normalized = layer(&ctx, &input, &weight, &bias, eps).unwrap();
+    let separate_quantized =
+        crate::kernels::gemm::quantize_w8a8_activation(&ctx, &separate_normalized).unwrap();
+    let (fused_normalized, fused_quantized) =
+        crate::kernels::gemm::layer_norm_quantize_w8a8_activation(
+            &ctx, &input, &weight, &bias, eps,
+        )
+        .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&fused_normalized).unwrap(),
+        download_bf16_as_fp32(&separate_normalized).unwrap()
+    );
+    assert_eq!(
+        fused_quantized.quantized_bytes().unwrap(),
+        separate_quantized.quantized_bytes().unwrap()
+    );
+    assert_eq!(
+        fused_quantized.row_scale_bits().unwrap(),
+        separate_quantized.row_scale_bits().unwrap()
+    );
+}
+
+#[test]
+fn cached_bias_then_residual_adaptive_layer_norm_1536_is_bitwise_exact_sm87_small_rows() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    if ctx.caps().sm != 87 {
+        return;
+    }
+    let (rows, cols) = (3usize, 1536usize);
+    let projection: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.017).sin())
+        .collect();
+    let residual: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.013).cos())
+        .collect();
+    let projection_bias: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.0001 - 0.05).collect();
+    let modulation: Vec<f32> = (0..2 * cols)
+        .map(|i| ((i as f32) * 0.0003).sin() * 0.25)
+        .collect();
+    let projection = upload_fp32_as_bf16(&ctx, &projection, vec![rows, cols]).unwrap();
+    let residual = upload_fp32_as_bf16(&ctx, &residual, vec![rows, cols]).unwrap();
+    let projection_bias = upload_fp32_as_bf16(&ctx, &projection_bias, vec![cols]).unwrap();
+    let modulation = upload_fp32_as_bf16(&ctx, &modulation, vec![2 * cols]).unwrap();
+    let biased =
+        crate::kernels::elementwise::bias_bf16(&ctx, &projection, Some(&projection_bias)).unwrap();
+    let legacy_hidden = add(&ctx, &biased, &residual).unwrap();
+    let legacy_normalized =
+        crate::kernels::norm::adaptive_layer(&ctx, &legacy_hidden, &modulation, 1.0e-6).unwrap();
+    let cached = crate::kernels::fused::bias_then_residual_adaptive_layer_bf16_cached_1536(
+        &ctx,
+        &projection,
+        &projection_bias,
+        &residual,
+        &modulation,
+        1.0e-6,
+    )
+    .unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_hidden).unwrap(),
+        download_bf16_as_fp32(&cached.hidden).unwrap()
+    );
+    assert_eq!(
+        download_bf16_as_fp32(&legacy_normalized).unwrap(),
+        download_bf16_as_fp32(&cached.normalized).unwrap()
+    );
 }

@@ -20,7 +20,9 @@ namespace {
 #include "../kernels/custom/math.cuh"
 #include "../kernels/custom/reduction.cuh"
 #include "../kernels/custom/quantization.cuh"
+#include "../kernels/custom/concat_quantization.cuh"
 #include "../kernels/custom/preprocess.cuh"
+#include "../kernels/custom/pillow_bicubic_u8.cuh"
 #include "../kernels/custom/attention.cuh"
 #include "../kernels/custom/normalization.cuh"
 #include "../kernels/custom/activation.cuh"
@@ -29,9 +31,9 @@ namespace {
 #include "../kernels/custom/fused.cuh"
 #include "../kernels/custom/cache.cuh"
 #include "../kernels/custom/linear_attention.cuh"
+#include "../kernels/custom/gdn_raw_inverse_f1.cuh"
 #include "../kernels/custom/gdn_chunk_state_wmma.cuh"
-#include "../kernels/custom/gdn_chunk_gemm_wmma.cuh"
-#include "../kernels/custom/gdn_attn_raw_wmma.cuh"
+#include "../kernels/custom/gdn_chunk_gemm_tri.cuh"
 }  // namespace
 
 extern "C" cudaError_t apxinf_sinusoidal_embedding_bf16(const void* positions,void* output,
@@ -169,6 +171,61 @@ extern "C" cudaError_t apxinf_static_quantize_bf16_e4m3(
   quantize_bf16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(input),
       static_cast<__nv_fp8_e4m3*>(output), count, 1.0f / scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_quantize_bf16_e4m3_packed8(
+    const void* input, void* output, int64_t count, float scale,
+    cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || count <= 0 || !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  const bool aligned =
+      (reinterpret_cast<uintptr_t>(input) % alignof(Bf16Pack8) == 0) &&
+      (reinterpret_cast<uintptr_t>(output) % alignof(Fp8Pack8) == 0);
+  if (!aligned || count < 8) {
+    int blocks = static_cast<int>((count + threads - 1) / threads);
+    blocks = blocks > 4096 ? 4096 : blocks;
+    quantize_bf16_e4m3_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<__nv_fp8_e4m3*>(output), count, 1.0f / scale);
+    return cudaGetLastError();
+  }
+  const int64_t vector_count = count / 8;
+  int blocks = static_cast<int>((vector_count + threads - 1) / threads);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  quantize_bf16_e4m3_packed8_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const Bf16Pack8*>(input),
+      static_cast<Fp8Pack8*>(output), vector_count, 1.0f / scale);
+  const int64_t tail = count - vector_count * 8;
+  if (tail != 0) {
+    quantize_bf16_e4m3_kernel<<<1, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input) + vector_count * 8,
+        static_cast<__nv_fp8_e4m3*>(output) + vector_count * 8,
+        tail, 1.0f / scale);
+  }
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_concat_rows_quantize_bf16_e4m3(
+    const void* first, const void* second, void* output,
+    int first_rows, int second_rows, int cols, float scale,
+    cudaStream_t stream) {
+  if (first == nullptr || second == nullptr || output == nullptr ||
+      first_rows <= 0 || second_rows <= 0 || cols <= 0 || !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t first_count = static_cast<int64_t>(first_rows) * cols;
+  const int64_t total_count =
+      static_cast<int64_t>(first_rows + second_rows) * cols;
+  int blocks = static_cast<int>((total_count + 255) / 256);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  concat_rows_quantize_bf16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(first),
+      static_cast<const __nv_bfloat16*>(second),
+      static_cast<__nv_fp8_e4m3*>(output), first_count, total_count,
+      1.0f / scale);
   return cudaGetLastError();
 }
 
@@ -925,6 +982,18 @@ extern "C" cudaError_t apxinf_static_cast_bf16_f32(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_broadcast_bf16_f32_rows(
+    const void* bias, void* output, int rows, int cols, cudaStream_t stream) {
+  if (bias == nullptr || output == nullptr || rows <= 0 || cols <= 0)
+    return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  const int64_t requested_blocks = (count + 255) / 256;
+  const int blocks = static_cast<int>(requested_blocks > 4096 ? 4096 : requested_blocks);
+  broadcast_bf16_f32_rows_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(bias), static_cast<float*>(output), count, cols);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_causal_conv1d_silu_bf16(
     const void* x, const void* weight, const void* state, void* out,
     void* new_state, int channels, int seq, int kernel_size,
@@ -935,7 +1004,13 @@ extern "C" cudaError_t apxinf_static_causal_conv1d_silu_bf16(
     return cudaErrorInvalidValue;
   }
   const int channel_blocks = (channels + 255) / 256;
-  causal_conv1d_silu_bf16_kernel<<<dim3(seq, channel_blocks), 256, 0, stream>>>(
+  const int token_blocks = (seq + CONV_TOKENS - 1) / CONV_TOKENS;
+  // The window a block stages: its own tokens plus the left context they share.
+  const int staged_tokens = seq < CONV_TOKENS ? seq : CONV_TOKENS;
+  const size_t conv_smem = static_cast<size_t>(
+      (staged_tokens + kernel_size - 1) * 256) * sizeof(__nv_bfloat16);
+  causal_conv1d_silu_bf16_kernel<<<dim3(token_blocks, channel_blocks), 256,
+                                   conv_smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x),
       static_cast<const __nv_bfloat16*>(weight),
       static_cast<const __nv_bfloat16*>(state),
@@ -960,7 +1035,7 @@ extern "C" cudaError_t apxinf_static_gdn_qk_prep_bf16(
   const int num_k_heads = key_dim / head_k_dim;
   if (num_v_heads % num_k_heads != 0) return cudaErrorInvalidValue;
   const size_t smem = static_cast<size_t>(2 * head_k_dim) * sizeof(float);
-  gdn_qk_prep_kernel<<<dim3(seq, num_k_heads), head_k_dim, smem, stream>>>(
+  gdn_qk_prep_kernel_t<float><<<dim3(seq, num_k_heads), head_k_dim, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(conv_out),
       static_cast<float*>(q_out), static_cast<float*>(k_out),
       seq, seq_pad, conv_dim, key_dim, num_v_heads, head_k_dim, scale, eps, recurrent != 0);
@@ -980,12 +1055,16 @@ extern "C" cudaError_t apxinf_static_gdn_vb_prep_bf16(
       num_v_heads <= 0 || head_v_dim <= 0 || ba_row_stride < num_v_heads) {
     return cudaErrorInvalidValue;
   }
-  gdn_vb_prep_kernel<<<dim3(seq, num_v_heads), head_v_dim, 0, stream>>>(
+  // The block width has to cover both the value channels and the VB_TOKENS
+  // threads that fold the per-token gate scalars.
+  const int vb_threads = head_v_dim > VB_TOKENS ? head_v_dim : VB_TOKENS;
+  gdn_vb_prep_kernel<<<dim3((seq + VB_TOKENS - 1) / VB_TOKENS, num_v_heads),
+                       vb_threads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(conv_out),
       static_cast<const __nv_bfloat16*>(b_proj),
       static_cast<const __nv_bfloat16*>(a_proj),
       static_cast<const float*>(dt_bias), static_cast<const float*>(a_log),
-      static_cast<float*>(v_out), static_cast<float*>(beta_out),
+      static_cast<__nv_bfloat16*>(v_out), static_cast<float*>(beta_out),
       static_cast<float*>(g_out),
       seq, seq_pad, conv_dim, v_offset, ba_row_stride, head_v_dim);
   return cudaGetLastError();
@@ -1018,39 +1097,6 @@ extern "C" cudaError_t apxinf_static_gdn_attn_raw_f32(
     return cudaErrorInvalidValue;
   }
   const int chunks = seq_pad / chunk_size;
-  if (policy->attn_raw_wmma != APXINF_GDN_WMMA_OFF && head_k_dim == 128 &&
-      chunk_size == 64) {
-    const size_t smem =
-        static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) * 4 +
-        static_cast<size_t>(64 * 64) * sizeof(float) * 2;
-    const bool split = policy->attn_raw_wmma >= APXINF_GDN_WMMA_SPLIT2;
-    const void* entry =
-        split ? reinterpret_cast<const void*>(gdn_attn_raw_wmma_kernel<true>)
-              : reinterpret_cast<const void*>(gdn_attn_raw_wmma_kernel<false>);
-    static const void* attn_wmma_opted = nullptr;
-    if (attn_wmma_opted != entry) {
-      const cudaError_t attr = cudaFuncSetAttribute(
-          entry, cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(smem));
-      if (attr != cudaSuccess) {
-        return attr;
-      }
-      attn_wmma_opted = entry;
-    }
-#define GDN_ATTN_WMMA_ARGS                                                     \
-  static_cast<const float*>(q), static_cast<const float*>(k),                  \
-      static_cast<const float*>(beta), static_cast<const float*>(g_cum),       \
-      static_cast<float*>(a_out), static_cast<float*>(t_out), seq_pad
-    if (split) {
-      gdn_attn_raw_wmma_kernel<true>
-          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_ATTN_WMMA_ARGS);
-    } else {
-      gdn_attn_raw_wmma_kernel<false>
-          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_ATTN_WMMA_ARGS);
-    }
-#undef GDN_ATTN_WMMA_ARGS
-    return cudaGetLastError();
-  }
   // One K tile and one Q tile for the chunk, rows padded by one float to keep
   // the warp off a single shared-memory bank (see the kernel comment).
   const size_t attn_smem =
@@ -1071,7 +1117,7 @@ extern "C" cudaError_t apxinf_static_gdn_attn_raw_f32(
   gdn_attn_raw_kernel<<<dim3(chunks, num_v_heads), 256, attn_smem, stream>>>(
       static_cast<const float*>(q), static_cast<const float*>(k),
       static_cast<const float*>(beta), static_cast<const float*>(g_cum),
-      static_cast<float*>(a_out), static_cast<float*>(t_out),
+      static_cast<float*>(a_out), static_cast<__nv_bfloat16*>(t_out),
       seq_pad, head_k_dim, chunk_size);
   return cudaGetLastError();
 }
@@ -1118,10 +1164,10 @@ static cudaError_t launch_chunk_gemm(
     }
   }
   gdn_chunk_gemm_kernel<TILE><<<dim3(chunks, num_v_heads), 256, gemm_smem, stream>>>(
-      static_cast<const float*>(a), static_cast<const float*>(v),
+      static_cast<const float*>(a), static_cast<const __nv_bfloat16*>(v),
       static_cast<const float*>(k), static_cast<const float*>(beta),
       static_cast<const float*>(g_cum),
-      static_cast<float*>(vt_out), static_cast<float*>(kcd_out),
+      static_cast<__nv_bfloat16*>(vt_out), static_cast<__nv_bfloat16*>(kcd_out),
       seq_pad, head_k_dim, head_v_dim, chunk_size);
   return cudaGetLastError();
 }
@@ -1144,49 +1190,28 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
   // the shipped shape rather than 64KB.
   const size_t gemm_smem = static_cast<size_t>(chunk_size) *
                            (head_v_dim + head_k_dim) * sizeof(__nv_bfloat16);
-  // Tensor-core form. Off by default, unlike the chunk-state scan: this
-  // kernel rounds both outputs to BF16, so the scalar form lands within
-  // 1.369621e-7 of an fp64 reference and the split form within 2.959516e-6 --
-  // 21.6x more, though both sit far below the BF16 grid the results are
-  // written on. It is worth 1.9% of the scene and the end-to-end probe moves
-  // with it, so it is the owner's call rather than a default.
-  if (policy->chunk_gemm_wmma != APXINF_GDN_WMMA_OFF && head_k_dim == 128 &&
-      head_v_dim == 128 &&
-      chunk_size == 64) {
-    const size_t smem = static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) * 2 +
-                        static_cast<size_t>(64 * 64) * sizeof(__nv_bfloat16) * 3 +
-                        static_cast<size_t>(64 * 128) * sizeof(float);
-    const int passes = policy->chunk_gemm_wmma;
-    const void* entry =
-        passes == 3 ? reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<3>)
-        : passes == 2 ? reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<2>)
-                      : reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<1>);
-    static const void* gemm_opted = nullptr;
-    if (gemm_opted != entry) {
+  if (head_k_dim == 128 && head_v_dim == 128 && chunk_size == 64 &&
+      policy->chunk_gemm_tile == 4) {
+    constexpr size_t tri_smem = 64 * 256 * sizeof(__nv_bfloat16) +
+                                64 * 64 * sizeof(float);
+    static thread_local int tri_opted_device = -1;
+    int device = -1;
+    const cudaError_t device_status = cudaGetDevice(&device);
+    if (device_status != cudaSuccess) return device_status;
+    if (tri_opted_device != device) {
       const cudaError_t attr = cudaFuncSetAttribute(
-          entry, cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(smem));
-      if (attr != cudaSuccess) {
-        return attr;
-      }
-      gemm_opted = entry;
+          reinterpret_cast<const void*>(gdn_chunk_gemm_tri_kernel<true, true, true>),
+          cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tri_smem));
+      if (attr != cudaSuccess) return attr;
+      tri_opted_device = device;
     }
-#define GDN_GEMM_WMMA_ARGS                                                     \
-  static_cast<const float*>(a), static_cast<const float*>(v),                  \
-      static_cast<const float*>(k), static_cast<const float*>(beta),           \
-      static_cast<const float*>(g_cum), static_cast<float*>(vt_out),           \
-      static_cast<float*>(kcd_out), seq_pad
-    if (passes == 3) {
-      gdn_chunk_gemm_wmma_kernel<3>
-          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_GEMM_WMMA_ARGS);
-    } else if (passes == 2) {
-      gdn_chunk_gemm_wmma_kernel<2>
-          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_GEMM_WMMA_ARGS);
-    } else {
-      gdn_chunk_gemm_wmma_kernel<1>
-          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_GEMM_WMMA_ARGS);
-    }
-#undef GDN_GEMM_WMMA_ARGS
+    gdn_chunk_gemm_tri_kernel<true, true, true>
+        <<<dim3(chunks, num_v_heads), 256, tri_smem, stream>>>(
+            static_cast<const float*>(a), static_cast<const __nv_bfloat16*>(v),
+            static_cast<const float*>(k), static_cast<const float*>(beta),
+            static_cast<const float*>(g_cum),
+            static_cast<__nv_bfloat16*>(vt_out), static_cast<__nv_bfloat16*>(kcd_out),
+            seq_pad);
     return cudaGetLastError();
   }
   switch (policy->chunk_gemm_tile) {
@@ -1231,8 +1256,10 @@ static cudaError_t launch_chunk_state(
   gdn_chunk_state_kernel<TILE, V_SPLIT>
       <<<dim3(num_v_heads, v_split), block_threads, smem, stream>>>(
           static_cast<const float*>(q), static_cast<const float*>(k),
-          static_cast<const float*>(g_cum), static_cast<const float*>(t_in),
-          static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),
+          static_cast<const float*>(g_cum),
+          static_cast<const __nv_bfloat16*>(t_in),
+          static_cast<const __nv_bfloat16*>(vt_in),
+          static_cast<const __nv_bfloat16*>(kcd_in),
           static_cast<float*>(state), static_cast<__nv_bfloat16*>(out),
           seq, seq_pad, head_k_dim, head_v_dim, chunk_size, total_chunks,
           out_row_width,
@@ -1321,24 +1348,25 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   // At the shipped shape this lands at 80KB, past the 48KB a kernel receives
   // without asking. Opt in once per instantiation; a device that refuses keeps
   // the error rather than launching with too little shared memory.
-  // Tensor-core form, for the shipped shape only.
-  //   1 / on / true -> split left operand, two BF16 passes, fp32-class error
-  //   lossy         -> one pass, left operand rounded to BF16
-  //   unset         -> the scalar kernel
-  // Default on where the tensor cores are worth this much: on Thor the split
-  // form is 1.4623 -> 1.1909 s of fixed cost at the same error.
-  const bool wmma_split = policy->chunk_state_wmma >= APXINF_GDN_WMMA_SPLIT2;
+  // Tensor-core form, for the shipped shape only. Every operand reaching this
+  // scan on the prefill path was already rounded to BF16 by its producer, so
+  // the one pass is exact here; on Thor it takes the fixed cost from 1.4623 to
+  // 1.1909 s.
   if (policy->chunk_state_wmma != APXINF_GDN_WMMA_OFF && head_k_dim == 128 &&
       head_v_dim == 128 && chunk_size == 64) {
+    // Leading dimensions are padded by 8 elements so the sixteen rows of a wmma
+    // tile do not all start on the same shared-memory bank; see the kernel for
+    // the bank arithmetic. Keep these strides identical to the kernel's.
+    constexpr int GDN_KP = 128 + 8;
+    constexpr int GDN_VP = 128 + 8;
     const size_t wmma_smem =
-        static_cast<size_t>(128 * 128) * sizeof(__nv_bfloat16) +  // state
-        static_cast<size_t>(64) * 1024 +                          // left operands
-        static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) +   // v_round
-        static_cast<size_t>(64 * 128) * sizeof(float) * 2;        // v_new, inter/out
+        static_cast<size_t>(128 * GDN_VP) * sizeof(__nv_bfloat16) +  // state
+        // Keep this in step with LHS_ELEMS in the kernel.
+        static_cast<size_t>(2 * 64 * GDN_KP) * sizeof(__nv_bfloat16) +
+        static_cast<size_t>(64 * GDN_VP) * sizeof(__nv_bfloat16) +   // v_round
+        static_cast<size_t>(64 * GDN_VP) * sizeof(float) * 2;        // v_new, inter/out
     const void* entry =
-        wmma_split
-            ? reinterpret_cast<const void*>(gdn_chunk_state_wmma_kernel<true>)
-            : reinterpret_cast<const void*>(gdn_chunk_state_wmma_kernel<false>);
+        reinterpret_cast<const void*>(gdn_chunk_state_wmma_kernel<float>);
     static const void* opted_in = nullptr;
     if (opted_in != entry) {
       const cudaError_t attr = cudaFuncSetAttribute(
@@ -1351,20 +1379,15 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
     }
     const float chunk_scale =
         static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_k_dim)));
-#define GDN_WMMA_ARGS                                                          \
-  static_cast<const float*>(q), static_cast<const float*>(k),                  \
-      static_cast<const float*>(g_cum), static_cast<const float*>(t_in),       \
-      static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),     \
-      static_cast<float*>(state), static_cast<__nv_bfloat16*>(out), seq,       \
-      seq_pad, total_chunks, out_row_width, chunk_scale
-    if (wmma_split) {
-      gdn_chunk_state_wmma_kernel<true>
-          <<<num_v_heads, 1024, wmma_smem, stream>>>(GDN_WMMA_ARGS);
-    } else {
-      gdn_chunk_state_wmma_kernel<false>
-          <<<num_v_heads, 1024, wmma_smem, stream>>>(GDN_WMMA_ARGS);
-    }
-#undef GDN_WMMA_ARGS
+    gdn_chunk_state_wmma_kernel<float>
+        <<<num_v_heads, 1024, wmma_smem, stream>>>(
+            static_cast<const float*>(q), static_cast<const float*>(k),
+            static_cast<const float*>(g_cum),
+            static_cast<const __nv_bfloat16*>(t_in),
+            static_cast<const __nv_bfloat16*>(vt_in),
+            static_cast<const __nv_bfloat16*>(kcd_in),
+            static_cast<float*>(state), static_cast<__nv_bfloat16*>(out), seq,
+            seq_pad, total_chunks, out_row_width, chunk_scale);
     return cudaGetLastError();
   }
 
@@ -1419,7 +1442,7 @@ extern "C" cudaError_t apxinf_static_gdn_recurrent_f32(
     if (block.x > 1024u) return cudaErrorInvalidValue;
 #define GDN_SPLIT_ARGS                                                        \
   static_cast<const float*>(q), static_cast<const float*>(k),                 \
-      static_cast<const float*>(v), static_cast<const float*>(beta),          \
+      static_cast<const __nv_bfloat16*>(v), static_cast<const float*>(beta),          \
       static_cast<const float*>(g), static_cast<float*>(state),               \
       static_cast<__nv_bfloat16*>(out), head_k_dim, head_v_dim
     switch (split) {
@@ -1437,7 +1460,7 @@ extern "C" cudaError_t apxinf_static_gdn_recurrent_f32(
   const size_t smem = static_cast<size_t>(2 * head_k_dim) * sizeof(float);
   gdn_recurrent_kernel<<<num_v_heads, head_v_dim, smem, stream>>>(
       static_cast<const float*>(q), static_cast<const float*>(k),
-      static_cast<const float*>(v), static_cast<const float*>(beta),
+      static_cast<const __nv_bfloat16*>(v), static_cast<const float*>(beta),
       static_cast<const float*>(g), static_cast<float*>(state),
       static_cast<__nv_bfloat16*>(out), head_k_dim, head_v_dim);
   return cudaGetLastError();
@@ -1453,12 +1476,12 @@ extern "C" cudaError_t apxinf_static_gated_rms_silu_bf16(
     return cudaErrorInvalidValue;
   }
   if (cols == 128) {
-    gated_rms_silu_bf16_rowfit_kernel<<<rows, 128, 0, stream>>>(
+    gated_rms_silu_bf16_warp4_kernel<<<(rows + GRS_ROWS - 1) / GRS_ROWS, 128, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x),
         static_cast<const __nv_bfloat16*>(z),
         static_cast<const __nv_bfloat16*>(weight),
         static_cast<__nv_bfloat16*>(out),
-        cols, z_heads, z_row_stride, z_col_offset, eps);
+        rows, cols, z_heads, z_row_stride, z_col_offset, eps);
     return cudaGetLastError();
   }
   const size_t smem = static_cast<size_t>(cols) * sizeof(float);
@@ -1494,7 +1517,17 @@ extern "C" cudaError_t apxinf_static_add_rms_norm_plus1_bf16(
     return cudaErrorInvalidValue;
   }
   const size_t smem = static_cast<size_t>(cols) * sizeof(float);
-  add_rms_norm_plus1_bf16_kernel<<<rows, 256, smem, stream>>>(
+  // The tested prefill shape uses only the exact vector mean branch.
+  if (rows >= 16 && cols == 2560) {
+    add_rms_norm_plus1_bf16_kernel<true><<<rows, 256, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(a),
+        static_cast<const __nv_bfloat16*>(b),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(sum_out),
+        static_cast<__nv_bfloat16*>(output), cols, eps);
+    return cudaGetLastError();
+  }
+  add_rms_norm_plus1_bf16_kernel<false><<<rows, 256, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(a),
       static_cast<const __nv_bfloat16*>(b),
       static_cast<const __nv_bfloat16*>(weight),
@@ -1516,6 +1549,23 @@ extern "C" cudaError_t apxinf_static_full_attn_prepare_bf16(
       rotary_dim <= 0 || (rotary_dim & 1) != 0 || rotary_dim > head_dim ||
       !(eps > 0.0f)) {
     return cudaErrorInvalidValue;
+  }
+  // Opt-in only for the measured D256 BF16 prefill geometry. Keep the
+  // original C ABI and generic route for all other inputs and decode.
+  if (seq > 1 && q_heads == 16 && kv_heads == 4 && head_dim == 256 &&
+      rotary_dim == 64 && fused_width == 10240 && cache_width == 1024) {
+    full_attn_prepare_bf16_warp_kernel
+        <<<dim3(seq, 6), 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(fused),
+        static_cast<const __nv_bfloat16*>(q_norm_w),
+        static_cast<const __nv_bfloat16*>(k_norm_w),
+        static_cast<const __nv_bfloat16*>(cos),
+        static_cast<const __nv_bfloat16*>(sin),
+        static_cast<__nv_bfloat16*>(q_out),
+        static_cast<__nv_bfloat16*>(k_cache),
+        static_cast<__nv_bfloat16*>(v_cache),
+        cache_offset, q_heads, kv_heads, fused_width, cache_width, eps);
+    return cudaGetLastError();
   }
   const size_t smem = static_cast<size_t>(head_dim) * sizeof(float);
   full_attn_prepare_bf16_kernel
@@ -1539,6 +1589,24 @@ extern "C" cudaError_t apxinf_static_sigmoid_gate_mul_bf16(
   if (attn == nullptr || fused == nullptr || rows <= 0 || heads <= 0 ||
       head_dim <= 0) {
     return cudaErrorInvalidValue;
+  }
+  // Vector BF16 route for D256 prefill. Inputs must be aligned and disjoint
+  // because the vector kernel promises restrict; retain the generic fallback.
+  if (rows > 1 && rows <= 65536 && heads == 16 && head_dim == 256 &&
+      fused_width == 10240) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(attn);
+    const uintptr_t f = reinterpret_cast<uintptr_t>(fused);
+    const uint64_t a_bytes = static_cast<uint64_t>(rows) * 4096 * 2;
+    const uint64_t f_bytes = static_cast<uint64_t>(rows) * 10240 * 2;
+    const bool aligned = ((a | f) & 15U) == 0;
+    const bool no_overflow = a <= UINTPTR_MAX - a_bytes && f <= UINTPTR_MAX - f_bytes;
+    const bool disjoint = no_overflow && (a + a_bytes <= f || f + f_bytes <= a);
+    if (aligned && disjoint) {
+      sigmoid_gate_mul_bf16_vec8_kernel<<<rows * 2, 256, 0, stream>>>(
+          static_cast<__nv_bfloat16*>(attn),
+          static_cast<const __nv_bfloat16*>(fused), rows);
+      return cudaGetLastError();
+    }
   }
   sigmoid_gate_mul_bf16_kernel<<<rows, 256, 0, stream>>>(
       static_cast<__nv_bfloat16*>(attn),
@@ -1694,5 +1762,208 @@ extern "C" cudaError_t apxinf_static_gelu_exact_bf16(
   gelu_exact_bf16_kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(input),
       static_cast<__nv_bfloat16*>(output), count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_adaln_gate_residual_rms_bf16(
+    const void* proj, const void* residual, const void* gate, const void* weight,
+    const void* scale, const void* shift, void* hidden, void* normalized,
+    int rows, int cols, float eps, cudaStream_t stream) {
+  if (!proj || !residual || !gate || !weight || !scale || !shift || !hidden || !normalized ||
+      rows <= 0 || cols <= 0 || cols > 8192 || !(eps > 0.0f)) return cudaErrorInvalidValue;
+  adaln_gate_residual_rms_bf16_kernel<<<rows, 256, cols * sizeof(float), stream>>>(
+      static_cast<const __nv_bfloat16*>(proj), static_cast<const __nv_bfloat16*>(residual),
+      static_cast<const __nv_bfloat16*>(gate), static_cast<const __nv_bfloat16*>(weight),
+      static_cast<const __nv_bfloat16*>(scale), static_cast<const __nv_bfloat16*>(shift),
+      static_cast<__nv_bfloat16*>(hidden), static_cast<__nv_bfloat16*>(normalized), cols, eps);
+  return cudaGetLastError();
+}
+
+// Isolated BF16-physical Q/K prefill route. The four entry points reject any
+// policy/shape that would need a legacy FP32 consumer.
+extern "C" cudaError_t apxinf_static_gdn_qk_prep_qk_bf16(
+    const void* conv_out, void* q_out, void* k_out,
+    int seq, int seq_pad, int conv_dim, int key_dim,
+    int num_v_heads, int head_k_dim, float scale, float eps, int recurrent,
+    cudaStream_t stream) {
+  if (!conv_out || !q_out || !k_out || seq <= 0 || seq_pad < seq ||
+      conv_dim < 2 * key_dim || key_dim <= 0 || num_v_heads <= 0 ||
+      head_k_dim != 128 || (head_k_dim & (head_k_dim - 1)) || !(eps > 0.0f) ||
+      recurrent || key_dim % head_k_dim) return cudaErrorInvalidValue;
+  const int num_k_heads = key_dim / head_k_dim;
+  if (num_v_heads % num_k_heads) return cudaErrorInvalidValue;
+  const size_t smem = static_cast<size_t>(2 * head_k_dim) * sizeof(float);
+  gdn_qk_prep_kernel_t<__nv_bfloat16>
+      <<<dim3(seq, num_k_heads), head_k_dim, smem, stream>>>(
+          static_cast<const __nv_bfloat16*>(conv_out),
+          static_cast<__nv_bfloat16*>(q_out), static_cast<__nv_bfloat16*>(k_out),
+          seq, seq_pad, conv_dim, key_dim, num_v_heads, head_k_dim, scale, eps,
+          false);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_gdn_attn_raw_solve_f1_qk_bf16(
+    const void* q, const void* k, const void* beta, const void* g_cum,
+    void* a_out, void* t_out, int seq_pad, int num_v_heads, int head_k_dim,
+    int chunk_size, cudaStream_t stream) {
+  if (!q || !k || !beta || !g_cum || !a_out || !t_out ||
+      seq_pad <= 0 || num_v_heads <= 0 || head_k_dim != 128 ||
+      chunk_size != 64 || seq_pad % 64) return cudaErrorInvalidValue;
+  // BF16 Q/K staging fits below the inverse's FP32 raw/inv/scratch stage.
+  constexpr int smem = (2 * 64 * 64 + 3 * 256) * sizeof(float);
+  static thread_local int opted_device = -1;
+  int device = -1;
+  const cudaError_t device_status = cudaGetDevice(&device);
+  if (device_status != cudaSuccess) return device_status;
+  if (opted_device != device) {
+    const cudaError_t attr = cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(gdn_raw_inverse_f1_t<__nv_bfloat16>),
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (attr != cudaSuccess) return attr;
+    opted_device = device;
+  }
+  gdn_raw_inverse_f1_t<__nv_bfloat16>
+      <<<dim3(seq_pad / 64, num_v_heads), 256, smem, stream>>>(
+          static_cast<const __nv_bfloat16*>(q),
+          static_cast<const __nv_bfloat16*>(k),
+          static_cast<const float*>(beta), static_cast<const float*>(g_cum),
+          static_cast<float*>(a_out), static_cast<__nv_bfloat16*>(t_out), seq_pad);
+  return cudaGetLastError();
+}
+
+// Experimental BF16 Q/K dot reassociation; inverse arithmetic is unchanged.
+extern "C" cudaError_t apxinf_static_gdn_gate_prep_bf16(
+    const void* b_proj, const void* a_proj, const void* dt_bias,
+    const void* a_log, void* beta_out, void* g_out,
+    int seq, int seq_pad, int num_v_heads, int ba_row_stride,
+    cudaStream_t stream) {
+  if (!b_proj || !a_proj || !dt_bias || !a_log || !beta_out || !g_out ||
+      seq <= 0 || seq_pad < seq || num_v_heads <= 0 ||
+      ba_row_stride < num_v_heads) return cudaErrorInvalidValue;
+  gdn_gate_only_kernel<<<dim3((seq - 1) / VB_TOKENS + 1, num_v_heads),
+                         128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(b_proj),
+      static_cast<const __nv_bfloat16*>(a_proj),
+      static_cast<const float*>(dt_bias), static_cast<const float*>(a_log),
+      static_cast<float*>(beta_out), static_cast<float*>(g_out),
+      seq, seq_pad, ba_row_stride);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_tri_k_bf16_direct_v(
+    const void* a, const void* conv_out, const void* k, const void* beta,
+    const void* g_cum, void* vt_out, void* kcd_out,
+    int seq, int seq_pad, int conv_dim, int v_offset, int num_v_heads,
+    int head_k_dim, int head_v_dim, int chunk_size,
+    cudaStream_t stream) {
+  if (!a || !conv_out || !k || !beta || !g_cum || !vt_out ||
+      !kcd_out || seq <= 0 || seq_pad < seq || seq_pad % 64 ||
+      num_v_heads <= 0 || head_k_dim != 128 || head_v_dim != 128 ||
+      chunk_size != 64 || v_offset < 0 ||
+      static_cast<int64_t>(v_offset) + static_cast<int64_t>(num_v_heads) * 128 > conv_dim) return cudaErrorInvalidValue;
+  constexpr size_t smem = 64 * 256 * sizeof(__nv_bfloat16) +
+                          64 * 64 * sizeof(float);
+  static thread_local int opted_device = -1;
+  int device = -1;
+  const cudaError_t device_status = cudaGetDevice(&device);
+  if (device_status != cudaSuccess) return device_status;
+  if (opted_device != device) {
+    const cudaError_t attr = cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(
+            gdn_chunk_gemm_tri_kernel<true, true, true, __nv_bfloat16, 8, true>),
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+    if (attr != cudaSuccess) return attr;
+    opted_device = device;
+  }
+  gdn_chunk_gemm_tri_kernel<true, true, true, __nv_bfloat16, 8, true>
+      <<<dim3(seq_pad / 64, num_v_heads), 256, smem, stream>>>(
+          static_cast<const float*>(a),
+          static_cast<const __nv_bfloat16*>(conv_out),
+          static_cast<const __nv_bfloat16*>(k),
+          static_cast<const float*>(beta), static_cast<const float*>(g_cum),
+          static_cast<__nv_bfloat16*>(vt_out),
+          static_cast<__nv_bfloat16*>(kcd_out),
+          seq_pad, seq, conv_dim, v_offset);
+  return cudaGetLastError();
+}
+
+// Typed BF16 state scan with fixed 1024-thread launch geometry. It does not
+// consume the legacy float-input kernel policy.
+extern "C" cudaError_t apxinf_static_gdn_chunk_state_qk_bf16(
+    const void* q, const void* k, const void* g_cum, const void* t_in,
+    const void* vt_in, const void* kcd_in, void* state, void* out,
+    int seq, int seq_pad, int num_v_heads, int head_k_dim, int head_v_dim,
+    int chunk_size, int total_chunks, int out_row_width,
+    cudaStream_t stream) {
+  if (!q || !k || !g_cum || !t_in || !vt_in || !kcd_in || !state ||
+      !out || seq <= 0 || seq_pad < seq || seq_pad != total_chunks * 64 ||
+      num_v_heads <= 0 || head_k_dim != 128 || head_v_dim != 128 ||
+      chunk_size != 64 || out_row_width != num_v_heads * 128)
+    return cudaErrorInvalidValue;
+  constexpr int KP = 136, VP = 136;
+  constexpr size_t smem =
+      static_cast<size_t>(128 * VP + 2 * 64 * KP + 64 * VP) *
+          sizeof(__nv_bfloat16) +
+      static_cast<size_t>(64 * VP) * sizeof(float);
+  static thread_local int opted_device = -1;
+  int device = -1;
+  const cudaError_t device_status = cudaGetDevice(&device);
+  if (device_status != cudaSuccess) return device_status;
+  if (opted_device != device) {
+    const cudaError_t attr = cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(
+            gdn_chunk_state_wmma_kernel<__nv_bfloat16, true, true>),
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+    if (attr != cudaSuccess) return attr;
+    opted_device = device;
+  }
+  const float scale =
+      static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_k_dim)));
+  gdn_chunk_state_wmma_kernel<__nv_bfloat16, true, true>
+      <<<num_v_heads, 1024, smem, stream>>>(
+          static_cast<const __nv_bfloat16*>(q),
+          static_cast<const __nv_bfloat16*>(k),
+          static_cast<const float*>(g_cum),
+          static_cast<const __nv_bfloat16*>(t_in),
+          static_cast<const __nv_bfloat16*>(vt_in),
+          static_cast<const __nv_bfloat16*>(kcd_in),
+          static_cast<float*>(state), static_cast<__nv_bfloat16*>(out),
+          seq, seq_pad, total_chunks, out_row_width, scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rgb_u8_to_temporal2_merge2_rect_bf16(
+    const void* rgb, void* patches, const void* lut, int grid_h, int grid_w,
+    cudaStream_t stream) {
+  if (!rgb || !patches || !lut || grid_h <= 0 || grid_w <= 0 ||
+      (grid_h & 1) || (grid_w & 1) ||
+      static_cast<int64_t>(grid_h) * grid_w > std::numeric_limits<int>::max())
+    return cudaErrorInvalidValue;
+  rgb_u8_to_temporal2_merge2_rect_bf16_kernel<<<grid_h * grid_w, 256, 0, stream>>>(
+      static_cast<const uint8_t*>(rgb), static_cast<uint16_t*>(patches),
+      static_cast<const uint16_t*>(lut), grid_h, grid_w);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_pillow_bicubic_u8_axis(
+    const void* input, void* output, const void* input_offsets,
+    const void* output_offsets, const void* bounds, const void* weights,
+    int ksize, int in_w, int in_h, int out_w, int out_h,
+    int batch, bool horizontal, cudaStream_t stream) {
+  if (!input || !output || !input_offsets || !output_offsets || !bounds || !weights ||
+      ksize <= 0 || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0 ||
+      (horizontal ? out_h != in_h : out_w != in_w) ||
+      batch <= 0 || batch > 65535 ||
+      static_cast<int64_t>(out_w) * out_h > std::numeric_limits<int>::max())
+    return cudaErrorInvalidValue;
+  const int64_t output_pixels = static_cast<int64_t>(out_w) * out_h;
+  const int64_t blocks = (output_pixels + 255) / 256;
+  if (blocks > std::numeric_limits<int>::max()) return cudaErrorInvalidValue;
+  pillow_bicubic_u8_axis_kernel<<<dim3(static_cast<unsigned int>(blocks), batch), 256, 0, stream>>>(
+      static_cast<const uint8_t*>(input), static_cast<uint8_t*>(output),
+      static_cast<const int64_t*>(input_offsets),
+      static_cast<const int64_t*>(output_offsets),
+      static_cast<const int32_t*>(bounds), static_cast<const int32_t*>(weights),
+      ksize, in_w, in_h, out_w, out_h, horizontal);
   return cudaGetLastError();
 }

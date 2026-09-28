@@ -1,33 +1,20 @@
 //! One BF16 Blocks implementation: vision, hybrid backbone and planning expert.
 //! Layer mathematics and physical state descriptions; no graph capture policy.
-use super::{GdnExecution, GdnRequest};
+use super::DirectExecution;
+use crate::qwen_drive::backend::kernels::fixed_profile::FIXED_SCENE_TOKENS;
 use crate::qwen_drive::backend::{
-    kernels, transfers, Context, CublasTranspose, DeviceBuffer, RuntimeBackend,
+    kernels, nvtx, transfers, Context, CublasTranspose, DeviceBuffer, RuntimeBackend,
 };
-use crate::qwen_drive::config::{ProjectionLayout, QwenDriveConfig};
-use crate::qwen_drive::diagnostics_enabled;
-use crate::qwen_drive::weights::bf16::{BackboneDeviceWeights, ExpertDeviceWeights, MixerWeights};
+use crate::qwen_drive::config::QwenDriveConfig;
+use crate::qwen_drive::inputs::ExpertConditioning;
+use crate::qwen_drive::weights::bf16::{
+    BackboneDeviceWeights, ExpertDeviceWeights, GdnInputSplitWeights, MixerWeights,
+};
 use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
-use kernels::{activation, attention, elementwise, embedding, gemm, linear_attention as la};
-use std::path::Path;
+use kernels::{attention, elementwise, embedding, gemm, linear_attention as la};
 use std::sync::Arc;
 const GDN_CHUNK: usize = 64;
-fn gdn_stage_mark(
-    ctx: &Context,
-    layer_idx: usize,
-    name: &str,
-    since: &mut std::time::Instant,
-) -> Result<()> {
-    ctx.synchronize().map_err(Error::Cuda)?;
-    qdiag!(
-        "[qwen_drive] gdn_stage layer={} {} ms={:.2}",
-        layer_idx,
-        name,
-        since.elapsed().as_secs_f64() * 1000.0
-    );
-    *since = std::time::Instant::now();
-    Ok(())
-}
+
 pub(crate) struct BackboneBf16 {
     pub config: QwenDriveConfig,
     pub cuda: Arc<RuntimeBackend>,
@@ -90,49 +77,8 @@ pub(crate) struct BackboneState {
     pub rope_delta: i64,
     pub max_seq_len: usize,
     pub last_position: i64,
-    pub decode_step: Option<usize>,
 }
-pub(crate) fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
-    let Some(root) = std::env::var_os("APXINF_QWEN_TRACE_DIR") else {
-        return Ok(());
-    };
-    let width = *tensor.shape().dims().last().unwrap();
-    let count = tensor.numel() / width;
-    // Four sampled rows cannot tell a layer that is itself nondeterministic
-    // from one that merely mixes in a neighbour's unsampled row, and every
-    // sequence mixer here does mix across positions. APXINF_QWEN_TRACE_FULL
-    // dumps the whole tensor so the first affected layer is the real one.
-    let full = std::env::var_os("APXINF_QWEN_TRACE_FULL").is_some();
-    let rows = if full || count < 4 {
-        (0..count).collect::<Vec<_>>()
-    } else {
-        vec![0, 1, 2, count - 1]
-    };
-    let buffer = DeviceBuffer::from_tensor(tensor).map_err(Error::Cuda)?;
-    let mut bytes = Vec::new();
-    for row in rows {
-        let view = buffer
-            .view(
-                row * width * tensor.dtype().size_in_bytes(),
-                width * tensor.dtype().size_in_bytes(),
-            )
-            .map_err(Error::Cuda)?;
-        let t = view
-            .as_tensor(Shape::new(vec![1, width]), tensor.dtype())
-            .map_err(Error::Cuda)?;
-        let values = transfers::to_cpu(&t)?
-            .to_f32_vec()
-            .map_err(|e| Error::Other(e.to_string()))?;
-        for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    let root = Path::new(&root);
-    std::fs::create_dir_all(root).map_err(|e| Error::Other(e.to_string()))?;
-    std::fs::write(root.join(format!("{name}.f32")), bytes)
-        .map_err(|e| Error::Other(e.to_string()))?;
-    Ok(())
-}
+
 fn bf16_round(value: f32) -> f32 {
     half::bf16::from_f32(value).to_f32()
 }
@@ -152,76 +98,92 @@ fn alloc_zeros(ctx: &Context, bytes: usize) -> Result<DeviceBuffer> {
     kernels::scratch_buffer_zeroed(ctx, bytes.max(1))
 }
 
-fn alloc_scan_scratch(ctx: &Context, bytes: usize, padded: bool) -> Result<DeviceBuffer> {
-    if padded {
-        alloc_zeros(ctx, bytes)
-    } else {
-        kernels::scratch_buffer(ctx, bytes.max(1))
+/// Scan scratch shaped `[heads, seq_pad, width]`.
+///
+/// The prep kernels write one row per token and leave the rows that round the
+/// sequence up to a chunk multiple, so those rows are the only ones the arena
+/// has to clear. At the shipped prefill that is 7 rows of 3392, and clearing
+/// all of them instead was 25.6 ms a request.
+fn alloc_scan_scratch(
+    ctx: &Context,
+    heads: usize,
+    seq_pad: usize,
+    seq: usize,
+    width_bytes: usize,
+) -> Result<DeviceBuffer> {
+    if seq_pad == seq {
+        return kernels::scratch_buffer(ctx, (heads * seq_pad * width_bytes).max(1));
     }
+    kernels::scratch_buffer_tail_zeroed(ctx, heads, seq_pad * width_bytes, seq * width_bytes)
 }
 
-fn linear_checkpoint(
-    layout: ProjectionLayout,
+/// Fixed tuned GDN input projection into the original packed row stride.
+/// The safe GEMM API validates devices, extents and row strides for both calls.
+fn gdn_input_split(
     ctx: &Context,
     input: &Tensor,
-    weight: &Tensor,
+    weights: &GdnInputSplitWeights,
 ) -> Result<Tensor> {
-    // Under the gate the loader has already stored this weight as [in, out],
-    // so the raw path's [out, in] check does not apply to it.
-    if layout == ProjectionLayout::Tuned {
-        return gemm::bf16(ctx, input, weight);
-    }
-    let x = input.shape().dims();
-    let w = weight.shape().dims();
-    if x.len() != 2
-        || w.len() != 2
-        || x[1] != w[1]
-        || input.dtype() != DType::BF16
-        || weight.dtype() != DType::BF16
+    const M: usize = FIXED_SCENE_TOKENS;
+    const K: usize = 2560;
+    const N: usize = 12352;
+    const MAIN: usize = 12288;
+    const AB: usize = 64;
+    if input.shape().dims() != [M, K]
+        || weights.main.shape().dims() != [K, MAIN]
+        || weights.ab.shape().dims() != [K, AB]
+        || [input, &weights.main, &weights.ab]
+            .iter()
+            .any(|tensor| tensor.dtype() != DType::BF16)
     {
         return Err(Error::Other(
-            "qwen_drive: checkpoint linear shape/dtype mismatch".into(),
+            "qwen_drive: GDN split weight/input contract mismatch".into(),
         ));
     }
-    let stride =
-        i32::try_from(x[1]).map_err(|_| Error::Other("linear input stride overflow".into()))?;
-    let columns =
-        i32::try_from(w[0]).map_err(|_| Error::Other("linear output stride overflow".into()))?;
-    let output = device_tensor(ctx, &[x[0], w[0]], DType::BF16)?;
+    let output = device_tensor(ctx, &[M, N], DType::BF16)?;
+    let x = DeviceBuffer::from_tensor(input).map_err(Error::Cuda)?;
+    let main = DeviceBuffer::from_tensor(&weights.main).map_err(Error::Cuda)?;
+    let ab = DeviceBuffer::from_tensor(&weights.ab).map_err(Error::Cuda)?;
+    let destination = DeviceBuffer::from_tensor(&output).map_err(Error::Cuda)?;
+    // This is a strided buffer view, not a dense [M,AB] Tensor. Its final row
+    // ends exactly at M*N BF16 words. view() retains the parent allocation.
+    let ab_bytes = ((M - 1) * N + AB) * 2;
+    let ab_destination = destination.view(MAIN * 2, ab_bytes).map_err(Error::Cuda)?;
     gemm::write_ex(
         ctx,
         DType::BF16,
         CublasTranspose::None,
-        CublasTranspose::Transpose,
-        x[0],
-        w[0],
-        x[1],
+        CublasTranspose::None,
+        M,
+        MAIN,
+        K,
         1.0,
-        &DeviceBuffer::from_tensor(input).map_err(Error::Cuda)?,
-        stride,
-        &DeviceBuffer::from_tensor(weight).map_err(Error::Cuda)?,
-        stride,
+        &x,
+        K as i32,
+        &main,
+        MAIN as i32,
         0.0,
-        &DeviceBuffer::from_tensor(&output).map_err(Error::Cuda)?,
-        columns,
+        &destination,
+        N as i32,
+    )?;
+    gemm::write_ex(
+        ctx,
+        DType::BF16,
+        CublasTranspose::None,
+        CublasTranspose::None,
+        M,
+        AB,
+        K,
+        1.0,
+        &x,
+        K as i32,
+        &ab,
+        AB as i32,
+        0.0,
+        &ab_destination,
+        N as i32,
     )?;
     Ok(output)
-}
-
-fn project_and_pack(
-    layout: ProjectionLayout,
-    ctx: &Context,
-    input: &Tensor,
-    weights: &[&Tensor],
-) -> Result<Tensor> {
-    let rows = input.shape().dims()[0];
-    let mut outputs = Vec::with_capacity(weights.len());
-    for weight in weights {
-        let value = linear_checkpoint(layout, ctx, input, weight)?;
-        outputs.push(value.reshape(vec![rows, value.shape().dims()[1], 1, 1])?);
-    }
-    let packed = elementwise::concat_channels_bf16(ctx, &outputs.iter().collect::<Vec<_>>())?;
-    packed.reshape(vec![rows, packed.shape().dims()[1]])
 }
 
 pub(crate) fn upload_u32(ctx: &Context, values: &[u32]) -> Result<DeviceBuffer> {
@@ -254,13 +216,19 @@ impl BackboneBf16 {
         let text = &config.text;
         let device = cuda.device_id();
         let mut caches = Vec::with_capacity(text.n_layers);
+        let capacity = max_seq_len
+            .checked_add(config.num_future_points)
+            .ok_or_else(|| Error::Other("qwen_drive joint KV capacity overflow".into()))?;
         for index in 0..text.n_layers {
             if text.is_full_attention(index) {
-                let bytes =
-                    max_seq_len * text.n_kv_heads * text.head_dim * DType::BF16.size_in_bytes();
+                let bytes = capacity
+                    .checked_mul(text.n_kv_heads)
+                    .and_then(|n| n.checked_mul(text.head_dim))
+                    .and_then(|n| n.checked_mul(DType::BF16.size_in_bytes()))
+                    .ok_or_else(|| Error::Other("qwen_drive joint KV size overflow".into()))?;
                 let k = DeviceBuffer::alloc_zeros(bytes, device).map_err(Error::Cuda)?;
                 let v = DeviceBuffer::alloc_zeros(bytes, device).map_err(Error::Cuda)?;
-                let shape = Shape::new(vec![max_seq_len, text.n_kv_heads, text.head_dim]);
+                let shape = Shape::new(vec![capacity, text.n_kv_heads, text.head_dim]);
                 caches.push(LayerCache::FullAttention {
                     k: k.as_tensor(shape.clone(), DType::BF16)
                         .map_err(Error::Cuda)?,
@@ -416,18 +384,7 @@ impl BackboneBf16 {
             (dims[0], dims[1])
         };
         let vocab = self.config.text.vocab_size;
-        if m == 1 {
-            if let Some(file) = std::env::var_os("APXINF_QWEN_HEAD_INPUT") {
-                let values = transfers::to_cpu(x)?
-                    .to_f32_vec()
-                    .map_err(|error| Error::Other(error.to_string()))?;
-                let bytes: Vec<u8> = values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect();
-                std::fs::write(file, bytes).map_err(|error| Error::Other(error.to_string()))?;
-            }
-        }
+
         let out = device_tensor(ctx, &[m, vocab], DType::BF16)?;
         let a = DeviceBuffer::from_tensor(x).map_err(Error::Cuda)?;
         let b = DeviceBuffer::from_tensor(&self.weights.embed_tokens).map_err(Error::Cuda)?;
@@ -458,24 +415,31 @@ impl BackboneBf16 {
         post_norm: &Tensor,
         gate_up_w: &Tensor,
         down_w: &Tensor,
-        trace: bool,
-    ) -> Result<Tensor> {
+        next_norm: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let ctx = self.ctx();
         let eps = self.config.text.rms_norm_eps;
         let (x, normed) = la::add_rms_norm_plus1(ctx, x, delta, post_norm, eps)?;
-        if trace {
-            trace_rows("text0_residual", &x)?;
+
+        let act = gemm::bf16_swiglu_checkpoint(ctx, &normed, gate_up_w)?;
+        let down = gemm::bf16(ctx, &act, down_w)?;
+        // The operator may return padded physical rows to accelerate the down
+        // projection. Only the logical request rows enter the residual path.
+        let rows = normed.shape().dims()[0];
+        let width = down.shape().dims()[1];
+        let down = DeviceBuffer::from_tensor(&down)
+            .map_err(Error::Cuda)?
+            .view(0, rows * width * DType::BF16.size_in_bytes())
+            .map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![rows, width]), DType::BF16)
+            .map_err(Error::Cuda)?;
+
+        if let Some(weight) = next_norm {
+            let (hidden, normalized) = la::add_rms_norm_plus1(ctx, &x, &down, weight, eps)?;
+            Ok((hidden, Some(normalized)))
+        } else {
+            elementwise::add(ctx, &x, &down).map(|hidden| (hidden, None))
         }
-        let gu = gemm::bf16(ctx, &normed, gate_up_w)?;
-        let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
-        let down = linear_checkpoint(self.weights.projection_layout, ctx, &act, down_w)?;
-        if trace {
-            trace_rows("text0_post_norm", &normed)?;
-            trace_rows("text0_gate_up", &gu)?;
-            trace_rows("text0_swiglu", &act)?;
-            trace_rows("text0_down", &down)?;
-        }
-        elementwise::add(ctx, &x, &down)
     }
     pub(crate) fn forward_full_attention(
         &self,
@@ -485,7 +449,9 @@ impl BackboneBf16 {
         cos: &Tensor,
         sin: &Tensor,
         seq: usize,
-    ) -> Result<Tensor> {
+        normalized: Option<&Tensor>,
+        next_norm: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let cuda = Arc::clone(&self.cuda);
         let ctx = cuda.context();
         let text = &self.config.text;
@@ -498,19 +464,12 @@ impl BackboneBf16 {
         let kv_heads = text.n_kv_heads;
         let head_dim = text.head_dim;
         let rotary = text.rotary_dim();
-        let normed = la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?;
-        let fused = project_and_pack(
-            self.weights.projection_layout,
-            ctx,
-            &normed,
-            &[&w.q_w, &w.k_w, &w.v_w],
-        )?;
-        if layer_idx == 3 && seq > 1 {
-            trace_rows("text3_input_norm", &normed)?;
-            trace_rows("text3_fused_qkv", &fused)?;
-            trace_rows("text3_cos", cos)?;
-            trace_rows("text3_sin", sin)?;
-        }
+        let normed = match normalized {
+            Some(value) => value.clone(),
+            None => la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?,
+        };
+        let fused = gemm::bf16(ctx, &normed, &w.qkv_w)?;
+
         let q_out = device_tensor(ctx, &[seq, heads, head_dim], DType::BF16)?;
         let (k_cache, v_cache) = match &state.caches[layer_idx] {
             LayerCache::FullAttention { k, v } => (k.clone(), v.clone()),
@@ -536,30 +495,17 @@ impl BackboneBf16 {
         let kv_len = state.cache_len + seq;
         let k_view = cache_view(&k_cache, kv_len)?;
         let v_view = cache_view(&v_cache, kv_len)?;
-        let attn = attention::causal_gqa_bf16(ctx, &q_out, &k_view, &v_view, kv_len)?;
-        if layer_idx == 3 && seq > 1 {
-            trace_rows("text3_q", &q_out.reshape(vec![seq, heads * head_dim])?)?;
-            trace_rows(
-                "text3_k",
-                &k_view.reshape(vec![kv_len, kv_heads * head_dim])?,
-            )?;
-            trace_rows(
-                "text3_v",
-                &v_view.reshape(vec![kv_len, kv_heads * head_dim])?,
-            )?;
-            trace_rows(
-                "text3_attention",
-                &attn.reshape(vec![seq, heads * head_dim])?,
-            )?;
-        }
+        let fa4 = attention::try_gqa_bf16_fa4_d256_sm110(ctx, &q_out, &k_view, &v_view, kv_len)?;
+        let attn = match fa4 {
+            Some(output) => output,
+            None => attention::causal_gqa_bf16(ctx, &q_out, &k_view, &v_view, kv_len)?,
+        };
+
         let attn = attn.reshape(vec![seq, heads * head_dim])?;
         la::sigmoid_gate_mul(ctx, &attn, &fused, heads, head_dim)?;
-        let proj = linear_checkpoint(self.weights.projection_layout, ctx, &attn, &w.o_w)?;
-        if layer_idx == 3 && seq > 1 {
-            trace_rows("text3_gated_attention", &attn)?;
-            trace_rows("text3_out_proj", &proj)?;
-        }
-        self.forward_mlp(&x, &proj, &w.post_norm, &w.gate_up_w, &w.down_w, false)
+        let proj = gemm::bf16(ctx, &attn, &w.o_w)?;
+
+        self.forward_mlp(&x, &proj, &w.post_norm, &w.gate_up_w, &w.down_w, next_norm)
     }
     pub(crate) fn forward_gdn_eager(
         &self,
@@ -567,7 +513,9 @@ impl BackboneBf16 {
         x: Tensor,
         layer_idx: usize,
         seq: usize,
-    ) -> Result<Tensor> {
+        normalized: Option<&Tensor>,
+        next_norm: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let cuda = Arc::clone(&self.cuda);
         let ctx = cuda.context();
         let text = &self.config.text;
@@ -589,30 +537,26 @@ impl BackboneBf16 {
         let kernel = text.linear_conv_kernel_dim;
         let has_state = state.cache_len > 0;
 
-        // The scan is only part of a GDN layer; attribute what precedes it too.
-        let gdn_timed = seq > 1 && diagnostics_enabled();
-        let mut gdn_since = std::time::Instant::now();
-        let normed = la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?;
-        if gdn_timed {
-            gdn_stage_mark(ctx, layer_idx, "pre_norm", &mut gdn_since)?;
-        }
-        // Preserve all four reference GEMM geometries. Transposing or fusing
-        // these weights selects different BF16 reductions in cuBLAS.
+        let normed = match normalized {
+            Some(value) => value.clone(),
+            None => la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?,
+        };
+
         // One GEMM over the packed projection. Four separate ones read the same
         // weight bytes, but two were only [32, hidden] and dragged the group to
         // about 70GB/s where the MLP projections reach 172GB/s; the packed
         // weight also arrives in the layout the on-device pack used to build.
-        let zba = linear_checkpoint(self.weights.projection_layout, ctx, &normed, &w.zba_w)?
-            .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?;
-        if gdn_timed {
-            gdn_stage_mark(ctx, layer_idx, "project", &mut gdn_since)?;
+        let zba = if let Some(split) = w
+            .input_split
+            .as_ref()
+            .filter(|_| normed.shape().dims() == [FIXED_SCENE_TOKENS, 2560])
+        {
+            gdn_input_split(ctx, &normed, split)?
+        } else {
+            gemm::bf16(ctx, &normed, &w.zba_w)?
         }
-        if layer_idx == 0 && seq > 1 {
-            trace_rows("text0_input", &x)?;
-            trace_rows("text0_input_norm", &normed)?;
-            trace_rows("text0_zba", &zba)?;
-        }
-        let conv_out = device_tensor(ctx, &[seq, conv_dim], DType::BF16)?;
+        .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?;
+
         let (state_current, state_next) = match &state.caches[layer_idx] {
             LayerCache::Gdn {
                 conv_state_a,
@@ -628,254 +572,293 @@ impl BackboneBf16 {
             }
             _ => return Err(Error::Other("qwen_drive: cache kind mismatch".into())),
         };
-        la::causal_conv1d_silu_bf16(
-            ctx,
-            &zba,
-            &w.conv_w,
-            if has_state {
-                Some(&state_current)
-            } else {
-                None
-            },
-            &conv_out,
-            &state_next,
-            kernel,
-        )?;
-        if let LayerCache::Gdn { flip, .. } = &mut state.caches[layer_idx] {
-            *flip = !*flip;
-        }
-        if layer_idx == 0 && seq > 1 {
-            trace_rows("text0_conv_silu", &conv_out)?;
-        }
-        if gdn_timed {
-            gdn_stage_mark(ctx, layer_idx, "conv_silu", &mut gdn_since)?;
-        }
-
-        let recurrent_decode = has_state && seq == 1;
-        let seq_pad = if recurrent_decode {
-            1
-        } else {
-            seq.div_ceil(GDN_CHUNK) * GDN_CHUNK
-        };
-        let scan_padded = seq_pad != seq;
-        let q_buf = alloc_scan_scratch(
-            ctx,
-            num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes(),
-            scan_padded,
-        )?;
-        let k_buf = alloc_scan_scratch(
-            ctx,
-            num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes(),
-            scan_padded,
-        )?;
-        let v_buf = alloc_scan_scratch(
-            ctx,
-            num_v_heads * seq_pad * head_v * DType::F32.size_in_bytes(),
-            scan_padded,
-        )?;
-        let beta_buf = alloc_scan_scratch(
-            ctx,
-            num_v_heads * seq_pad * DType::F32.size_in_bytes(),
-            scan_padded,
-        )?;
-        let g_buf = alloc_scan_scratch(
-            ctx,
-            num_v_heads * seq_pad * DType::F32.size_in_bytes(),
-            scan_padded,
-        )?;
-        if gdn_timed {
-            gdn_stage_mark(ctx, layer_idx, "qkvbg_alloc", &mut gdn_since)?;
-        }
-        la::gdn_qk_prep(
-            ctx,
-            &conv_out,
-            &q_buf,
-            &k_buf,
-            seq_pad,
-            num_k_heads,
-            num_v_heads,
-            head_k,
-            key_dim,
-            recurrent_decode,
-            1e-6,
-        )?;
-        la::gdn_vb_prep(
-            ctx,
-            &conv_out,
-            &zba,
-            b_col,
-            a_col,
-            &w.dt_bias,
-            &w.a_log,
-            &v_buf,
-            &beta_buf,
-            &g_buf,
-            seq_pad,
-            num_v_heads,
-            head_v,
-            2 * key_dim,
-        )?;
-        let gdn_out = device_tensor(ctx, &[seq, value_dim], DType::BF16)?;
-        let rec_state = match &state.caches[layer_idx] {
+        let recurrent = match &state.caches[layer_idx] {
             LayerCache::Gdn { recurrent, .. } => recurrent.clone(),
             _ => return Err(Error::Other("qwen_drive: cache kind mismatch".into())),
         };
-        let rec_buf = DeviceBuffer::from_tensor(&rec_state).map_err(Error::Cuda)?;
-        if recurrent_decode {
-            la::gdn_recurrent(
-                ctx,
-                &q_buf,
-                &k_buf,
-                &v_buf,
-                &beta_buf,
-                &g_buf,
-                &rec_buf,
-                &gdn_out,
-                num_v_heads,
-                head_k,
-                head_v,
-            )?;
+        let recurrent_buffer = DeviceBuffer::from_tensor(&recurrent).map_err(Error::Cuda)?;
+        let fused = if has_state {
+            None
         } else {
-            let chunks = seq_pad / GDN_CHUNK;
-            let g_cum = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
-            let a_buf = alloc_zeros(
+            la::try_causal_conv_gdn_prefill_bf16(
                 ctx,
-                num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * DType::F32.size_in_bytes(),
-            )?;
-            let t_buf = alloc_zeros(
+                &zba,
+                &w.conv_w,
+                &state_next,
+                &w.a_log,
+                &w.dt_bias_bf16,
+                &recurrent_buffer,
+                [num_k_heads, num_v_heads, head_k, head_v],
+            )?
+        };
+        let gdn_out = if let Some(output) = fused {
+            output
+        } else {
+            let conv_out = device_tensor(ctx, &[seq, conv_dim], DType::BF16)?;
+            la::causal_conv1d_silu_bf16(
                 ctx,
-                num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * DType::F32.size_in_bytes(),
+                &zba,
+                &w.conv_w,
+                if has_state {
+                    Some(&state_current)
+                } else {
+                    None
+                },
+                &conv_out,
+                &state_next,
+                kernel,
             )?;
-            let vt_buf = alloc_zeros(
-                ctx,
-                num_v_heads * chunks * GDN_CHUNK * head_v * DType::F32.size_in_bytes(),
-            )?;
-            let kcd_buf = alloc_zeros(
-                ctx,
-                num_v_heads * chunks * GDN_CHUNK * head_k * DType::F32.size_in_bytes(),
-            )?;
-            // Covers the q/k/v/beta/g preparation kernels and the scan's own
-            // zeroed allocations, which sit between conv_silu and cumsum.
-            if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "prep_alloc", &mut gdn_since)?;
-            }
-            la::gdn_cumsum(ctx, &g_buf, &g_cum, seq_pad, num_v_heads, GDN_CHUNK)?;
-            if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "cumsum", &mut gdn_since)?;
-            }
-            la::gdn_attn_raw(
-                ctx,
-                &q_buf,
-                &k_buf,
-                &beta_buf,
-                &g_cum,
-                &a_buf,
-                &t_buf,
-                seq_pad,
-                num_v_heads,
-                head_k,
-                GDN_CHUNK,
-            )?;
-            if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "attn_raw", &mut gdn_since)?;
-            }
-            la::gdn_tri_solve(ctx, &a_buf, num_v_heads * chunks, GDN_CHUNK)?;
-            if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "tri_solve", &mut gdn_since)?;
-            }
-            la::gdn_chunk_gemm(
-                ctx,
-                &a_buf,
-                &v_buf,
-                &k_buf,
-                &beta_buf,
-                &g_cum,
-                &vt_buf,
-                &kcd_buf,
-                seq_pad,
-                num_v_heads,
-                head_k,
-                head_v,
-                GDN_CHUNK,
-            )?;
-            if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "chunk_gemm", &mut gdn_since)?;
-            }
-            la::gdn_chunk_state(
-                ctx,
-                &q_buf,
-                &k_buf,
-                &g_cum,
-                &t_buf,
-                &vt_buf,
-                &kcd_buf,
-                &rec_buf,
-                &gdn_out,
-                seq_pad,
-                num_v_heads,
-                head_k,
-                head_v,
-                GDN_CHUNK,
-            )?;
-            if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "chunk_state", &mut gdn_since)?;
-            }
-        }
-        if layer_idx == 0 && seq > 1 {
-            trace_rows("text0_core", &gdn_out)?;
-        }
-        // Opt-in fingerprints of the first two recurrent outputs and convolution row.
-        if layer_idx == 0 && seq > 1 && diagnostics_enabled() {
-            let gbuf = DeviceBuffer::from_tensor(&gdn_out).map_err(Error::Cuda)?;
-            let gview = gbuf
-                .view(0, 2 * value_dim * DType::BF16.size_in_bytes())
-                .map_err(Error::Cuda)?;
-            let gt = gview
-                .as_tensor(Shape::new(vec![2, value_dim]), DType::BF16)
-                .map_err(Error::Cuda)?;
-            let gvals = transfers::to_cpu(&gt)?
-                .to_f32_vec()
-                .map_err(|e| Error::Other(format!("qwen_drive gdn_row: {e}")))?;
-            let gl2 = |r: usize| -> f64 {
-                gvals[r * value_dim..(r + 1) * value_dim]
-                    .iter()
-                    .map(|&v| (v as f64) * (v as f64))
-                    .sum::<f64>()
-                    .sqrt()
+
+            let recurrent_decode = has_state && seq == 1;
+            let seq_pad = if recurrent_decode {
+                1
+            } else {
+                seq.div_ceil(GDN_CHUNK) * GDN_CHUNK
             };
-            let g_line0 = format!(
-                "[qwen_drive] gdn_row0 l2={:.4} first4={:?}",
-                gl2(0),
-                &gvals[..gvals.len().min(4)]
-            );
-            let g_line1 = format!(
-                "[qwen_drive] gdn_row1 l2={:.4} first4={:?}",
-                gl2(1),
-                &gvals[value_dim..value_dim + 4]
-            );
-            let cbuf = DeviceBuffer::from_tensor(&conv_out).map_err(Error::Cuda)?;
-            let cview = cbuf
-                .view(0, conv_dim * DType::BF16.size_in_bytes())
-                .map_err(Error::Cuda)?;
-            let ct = cview
-                .as_tensor(Shape::new(vec![1, conv_dim]), DType::BF16)
-                .map_err(Error::Cuda)?;
-            let cvals = transfers::to_cpu(&ct)?
-                .to_f32_vec()
-                .map_err(|e| Error::Other(format!("qwen_drive conv_row: {e}")))?;
-            let cl2: f64 = cvals
-                .iter()
-                .map(|&v| (v as f64) * (v as f64))
-                .sum::<f64>()
-                .sqrt();
-            let c_line = format!(
-                "[qwen_drive] conv_row0 l2={:.4} first4={:?}",
-                cl2,
-                &cvals[..cvals.len().min(4)]
-            );
-            qdiag!("{}", g_line0);
-            qdiag!("{}", g_line1);
-            qdiag!("{}", c_line);
+            let f32_bytes = DType::F32.size_in_bytes();
+            // Choose physical Q/K representation once before allocating scratch.
+            // Decode and every diagnostic/fallback policy stay on the FP32 route.
+            let qk_bf16 =
+                la::gdn_qk_bf16_prefill_supported(ctx, recurrent_decode, head_k, head_v, GDN_CHUNK);
+            let qk_bytes = if qk_bf16 {
+                DType::BF16.size_in_bytes()
+            } else {
+                f32_bytes
+            };
+            let scan = |width: usize| alloc_scan_scratch(ctx, num_v_heads, seq_pad, seq, width);
+            let q_buf = scan(head_k * qk_bytes)?;
+            let k_buf = scan(head_k * qk_bytes)?;
+            // Typed prefill reads V directly from the convolution output. Decode
+            // and fallback prefill still use the head-major scratch buffer.
+            let v_buf = if qk_bf16 {
+                None
+            } else {
+                Some(scan(head_v * DType::BF16.size_in_bytes())?)
+            };
+            let beta_buf = scan(f32_bytes)?;
+            let g_buf = scan(f32_bytes)?;
+
+            if qk_bf16 {
+                la::gdn_qk_prep_qk_bf16(
+                    ctx,
+                    &conv_out,
+                    &q_buf,
+                    &k_buf,
+                    seq_pad,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k,
+                    key_dim,
+                    false,
+                    1e-6,
+                )?;
+            } else {
+                la::gdn_qk_prep(
+                    ctx,
+                    &conv_out,
+                    &q_buf,
+                    &k_buf,
+                    seq_pad,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k,
+                    key_dim,
+                    recurrent_decode,
+                    1e-6,
+                )?;
+            }
+            if qk_bf16 {
+                la::gdn_gate_prep(
+                    ctx,
+                    &zba,
+                    b_col,
+                    a_col,
+                    &w.dt_bias,
+                    &w.a_log,
+                    &beta_buf,
+                    &g_buf,
+                    seq_pad,
+                    num_v_heads,
+                )?;
+            } else {
+                la::gdn_vb_prep(
+                    ctx,
+                    &conv_out,
+                    &zba,
+                    b_col,
+                    a_col,
+                    &w.dt_bias,
+                    &w.a_log,
+                    v_buf
+                        .as_ref()
+                        .ok_or_else(|| Error::Other("GDN V scratch missing".into()))?,
+                    &beta_buf,
+                    &g_buf,
+                    seq_pad,
+                    num_v_heads,
+                    head_v,
+                    2 * key_dim,
+                )?;
+            }
+            let gdn_out = device_tensor(ctx, &[seq, value_dim], DType::BF16)?;
+            let rec_state = match &state.caches[layer_idx] {
+                LayerCache::Gdn { recurrent, .. } => recurrent.clone(),
+                _ => return Err(Error::Other("qwen_drive: cache kind mismatch".into())),
+            };
+            let rec_buf = DeviceBuffer::from_tensor(&rec_state).map_err(Error::Cuda)?;
+            if recurrent_decode {
+                la::gdn_recurrent(
+                    ctx,
+                    &q_buf,
+                    &k_buf,
+                    v_buf
+                        .as_ref()
+                        .ok_or_else(|| Error::Other("GDN V scratch missing".into()))?,
+                    &beta_buf,
+                    &g_buf,
+                    &rec_buf,
+                    &gdn_out,
+                    num_v_heads,
+                    head_k,
+                    head_v,
+                )?;
+            } else {
+                let chunks = seq_pad / GDN_CHUNK;
+                let g_cum = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
+                let a_buf = alloc_zeros(
+                    ctx,
+                    num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * DType::F32.size_in_bytes(),
+                )?;
+                // t, vt and kcd are written through __float2bfloat16 by the kernels
+                // that produce them and read by the scan alone, so they are held at
+                // the width they carry. a stays fp32: the triangular inverse works
+                // on it in place.
+                let t_buf = alloc_zeros(
+                    ctx,
+                    num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * DType::BF16.size_in_bytes(),
+                )?;
+                // a/t are chunk-square, so their padding is not a row suffix and
+                // they keep the whole-buffer clear. vt/kcd are token rows like the
+                // prep outputs: chunks * GDN_CHUNK is seq_pad.
+                let bf16_bytes = DType::BF16.size_in_bytes();
+                let vt_buf = scan(head_v * bf16_bytes)?;
+                let kcd_buf = scan(head_k * bf16_bytes)?;
+                // Covers the q/k/v/beta/g preparation kernels and the scan's own
+                // zeroed allocations, which sit between conv_silu and cumsum.
+
+                la::gdn_cumsum(ctx, &g_buf, &g_cum, seq_pad, num_v_heads, GDN_CHUNK)?;
+
+                if qk_bf16 {
+                    la::gdn_attn_raw_solve_f1_qk_bf16(
+                        ctx,
+                        &q_buf,
+                        &k_buf,
+                        &beta_buf,
+                        &g_cum,
+                        &a_buf,
+                        &t_buf,
+                        seq_pad,
+                        num_v_heads,
+                        head_k,
+                        GDN_CHUNK,
+                    )?;
+                } else {
+                    la::gdn_attn_raw(
+                        ctx,
+                        &q_buf,
+                        &k_buf,
+                        &beta_buf,
+                        &g_cum,
+                        &a_buf,
+                        &t_buf,
+                        seq_pad,
+                        num_v_heads,
+                        head_k,
+                        GDN_CHUNK,
+                    )?;
+
+                    la::gdn_tri_solve(ctx, &a_buf, num_v_heads * chunks, GDN_CHUNK)?;
+                }
+                if qk_bf16 {
+                    la::gdn_chunk_gemm_tri_k_bf16_direct_v(
+                        ctx,
+                        &a_buf,
+                        &conv_out,
+                        &k_buf,
+                        &beta_buf,
+                        &g_cum,
+                        &vt_buf,
+                        &kcd_buf,
+                        seq_pad,
+                        num_v_heads,
+                        head_k,
+                        head_v,
+                        GDN_CHUNK,
+                        2 * key_dim,
+                    )?;
+                } else {
+                    la::gdn_chunk_gemm(
+                        ctx,
+                        &a_buf,
+                        v_buf
+                            .as_ref()
+                            .ok_or_else(|| Error::Other("GDN V scratch missing".into()))?,
+                        &k_buf,
+                        &beta_buf,
+                        &g_cum,
+                        &vt_buf,
+                        &kcd_buf,
+                        seq_pad,
+                        num_v_heads,
+                        head_k,
+                        head_v,
+                        GDN_CHUNK,
+                    )?;
+                }
+
+                if qk_bf16 {
+                    la::gdn_chunk_state_qk_bf16(
+                        ctx,
+                        &q_buf,
+                        &k_buf,
+                        &g_cum,
+                        &t_buf,
+                        &vt_buf,
+                        &kcd_buf,
+                        &rec_buf,
+                        &gdn_out,
+                        seq_pad,
+                        num_v_heads,
+                        head_k,
+                        head_v,
+                        GDN_CHUNK,
+                    )?;
+                } else {
+                    la::gdn_chunk_state(
+                        ctx,
+                        &q_buf,
+                        &k_buf,
+                        &g_cum,
+                        &t_buf,
+                        &vt_buf,
+                        &kcd_buf,
+                        &rec_buf,
+                        &gdn_out,
+                        seq_pad,
+                        num_v_heads,
+                        head_k,
+                        head_v,
+                        GDN_CHUNK,
+                    )?;
+                }
+            }
+
+            // Opt-in fingerprints of the first two recurrent outputs and convolution row.
+
+            gdn_out
+        };
+        if let LayerCache::Gdn { flip, .. } = &mut state.caches[layer_idx] {
+            *flip = !*flip;
         }
         let gated = la::gated_rms_silu(
             ctx,
@@ -887,19 +870,9 @@ impl BackboneBf16 {
             1e-6,
         )?;
         let gated = gated.reshape(vec![seq, value_dim])?;
-        let proj = linear_checkpoint(self.weights.projection_layout, ctx, &gated, &w.out_w)?;
-        if layer_idx == 0 && seq > 1 {
-            trace_rows("text0_gated_norm", &gated)?;
-            trace_rows("text0_out_proj", &proj)?;
-        }
-        self.forward_mlp(
-            &x,
-            &proj,
-            &w.post_norm,
-            &w.gate_up_w,
-            &w.down_w,
-            layer_idx == 0 && seq > 1,
-        )
+        let proj = gemm::bf16(ctx, &gated, &w.out_w)?;
+
+        self.forward_mlp(&x, &proj, &w.post_norm, &w.gate_up_w, &w.down_w, next_norm)
     }
     pub(crate) fn embed_tokens(&self, token_ids: &[u32]) -> Result<Tensor> {
         let ids = upload_u32(self.ctx(), token_ids)?;
@@ -910,7 +883,7 @@ impl BackboneBf16 {
             &ids,
             token_ids.len(),
         )?;
-        trace_rows("model_language_model_embed_tokens", &output)?;
+
         Ok(output)
     }
     pub(crate) fn upload_pixels(&self, pixels: &Tensor) -> Result<Tensor> {
@@ -938,10 +911,7 @@ impl BackboneBf16 {
         for layer_idx in self.config.text.full_attention_layers() {
             match &state.caches[layer_idx] {
                 LayerCache::FullAttention { k, v } => {
-                    out.push((
-                        cache_view(k, state.cache_len)?,
-                        cache_view(v, state.cache_len)?,
-                    ));
+                    out.push((k.clone(), v.clone()));
                 }
                 _ => return Err(Error::Other("qwen_drive: cache kind mismatch".into())),
             }
@@ -949,6 +919,8 @@ impl BackboneBf16 {
         Ok(out)
     }
     pub(crate) fn new_state(&self, vision: std::rc::Rc<VisionState>) -> Result<BackboneState> {
+        // AOT module initialization is host-side work and must precede the
+        // first direct-model CUDA Graph capture.
         let max_seq_len = self.config.text.max_position_embeddings.min(16384);
         Ok(BackboneState {
             vision,
@@ -957,13 +929,36 @@ impl BackboneBf16 {
             rope_delta: 0,
             max_seq_len,
             last_position: 0,
-            decode_step: None,
         })
+    }
+    pub(crate) fn reset_state(&self, state: &mut BackboneState) -> Result<()> {
+        for cache in &mut state.caches {
+            if let LayerCache::Gdn {
+                conv_state_a,
+                conv_state_b,
+                flip,
+                recurrent,
+            } = cache
+            {
+                for tensor in [conv_state_a, conv_state_b, recurrent] {
+                    let buffer = DeviceBuffer::from_tensor(tensor).map_err(Error::Cuda)?;
+                    buffer
+                        .memset_async(0, buffer.len(), self.ctx().stream())
+                        .map_err(Error::Cuda)?;
+                }
+                *flip = false;
+            }
+        }
+        // Full-attention prefill overwrites the valid prefix. Attention only
+        // reads cache_len rows, so the unused capacity need not be cleared.
+        state.cache_len = 0;
+        state.rope_delta = 0;
+        state.last_position = 0;
+        Ok(())
     }
     pub(crate) fn run_text(
         &self,
         state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
         x: Tensor,
         positions: &[[u32; 3]],
     ) -> Result<Tensor> {
@@ -974,37 +969,56 @@ impl BackboneBf16 {
         let last = positions[seq - 1];
         state.last_position = last[0].max(last[1]).max(last[2]) as i64;
         let (cos, sin) = self.mrope_tables(positions)?;
+        self.run_text_device(state, x, seq, &cos, &sin)
+    }
+    pub(crate) fn run_text_device(
+        &self,
+        state: &mut BackboneState,
+        x: Tensor,
+        seq: usize,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let _language = nvtx::range("qwen_drive/language/blocks");
         let mut hidden = x;
+        let mut normalized = None;
         for layer in 0..self.config.text.n_layers {
-            hidden = match &self.weights.layers[layer] {
-                MixerWeights::FullAttention(_) => {
-                    self.forward_full_attention(state, hidden, layer, &cos, &sin, seq)?
-                }
+            let _block = nvtx::range(&format!("qwen_drive/language/block/{layer}"));
+            // Prefill (including the whole direct graph) carries the fused norm.
+            // Decode computes its norm inside the eager GDN block.
+            let next_norm = if seq > 1 {
+                self.weights.layers.get(layer + 1).map(|next| match next {
+                    MixerWeights::FullAttention(w) => &w.input_norm,
+                    MixerWeights::Gdn(w) => &w.input_norm,
+                })
+            } else {
+                None
+            };
+            let (output, next_normalized) = match &self.weights.layers[layer] {
+                MixerWeights::FullAttention(_) => self.forward_full_attention(
+                    state,
+                    hidden,
+                    layer,
+                    &cos,
+                    &sin,
+                    seq,
+                    normalized.as_ref(),
+                    next_norm,
+                )?,
+                MixerWeights::Gdn(_) if seq > 1 => self.forward_gdn_eager(
+                    state,
+                    hidden,
+                    layer,
+                    seq,
+                    normalized.as_ref(),
+                    next_norm,
+                )?,
                 MixerWeights::Gdn(_) => {
-                    let parity = match &state.caches[layer] {
-                        LayerCache::Gdn { flip, .. } => usize::from(*flip),
-                        _ => unreachable!(),
-                    };
-                    let request = GdnRequest {
-                        backend: &self.cuda,
-                        layer,
-                        layer_count: self.weights.layers.len(),
-                        parity,
-                        decode: seq == 1 && state.cache_len > 0,
-                        decode_step: state.decode_step.unwrap_or(0),
-                    };
-                    let (output, replayed) = execution.run(&request, hidden, &mut |x| {
-                        self.forward_gdn_eager(state, x, layer, seq)
-                    })?;
-                    if replayed {
-                        if let LayerCache::Gdn { flip, .. } = &mut state.caches[layer] {
-                            *flip = !*flip;
-                        }
-                    }
-                    output
+                    self.forward_gdn_eager(state, hidden, layer, seq, None, None)?
                 }
             };
-            trace_rows(&format!("backbone_layer_{layer}"), &hidden)?;
+            hidden = output;
+            normalized = next_normalized;
         }
         state.cache_len += seq;
         Ok(hidden)
@@ -1029,7 +1043,6 @@ impl BackboneBf16 {
     pub(crate) fn prefill(
         &self,
         state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
         token_ids: &[u32],
         pixels: &Tensor,
         grids: &[[u32; 3]],
@@ -1079,12 +1092,11 @@ impl BackboneBf16 {
             .max()
             .unwrap_or(0) as i64;
         state.rope_delta = max_pos + 1 - token_ids.len() as i64;
-        self.run_text(state, execution, x, &positions)
+        self.run_text(state, x, &positions)
     }
     pub(crate) fn forward_tokens(
         &self,
         state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
         token_ids: &[u32],
     ) -> Result<Tensor> {
         if token_ids.is_empty() || token_ids.len() > state.max_seq_len - state.cache_len {
@@ -1099,14 +1111,14 @@ impl BackboneBf16 {
             })
             .collect();
         let x = self.embed_tokens(token_ids)?;
-        self.run_text(state, execution, x, &positions)
+        self.run_text(state, x, &positions)
     }
 }
-mod vision {
+pub(super) mod vision {
     use apxinf_core::{Error, Result, Tensor};
 
-    use crate::qwen_drive::backend::{kernels, transfers, Context, DeviceBuffer};
-    use kernels::{activation, attention, elementwise, gemm, linear_attention as la, norm};
+    use crate::qwen_drive::backend::{kernels, nvtx, transfers, Context, DeviceBuffer};
+    use kernels::{activation, attention, elementwise, fused, gemm, linear_attention as la, norm};
 
     use crate::qwen_drive::config::QwenDriveConfig;
     use crate::qwen_drive::weights::bf16::VisionDeviceWeights;
@@ -1122,9 +1134,15 @@ mod vision {
         Ok(buffer)
     }
 
-    /// Run the vision tower over the concatenated per-image patch stream.
-    /// `pixel_values` is `[patches, 3 * temporal * patch * patch]` BF16 on device;
-    /// `grid_thw` holds one `[T, H, W]` entry per image.
+    pub(crate) struct PreparedVision {
+        offsets: Vec<u32>,
+        offsets_dev: DeviceBuffer,
+        pos_embeds: Tensor,
+        pos_ids_dev: DeviceBuffer,
+        max_tokens: usize,
+        total_patches: usize,
+        segments: usize,
+    }
     pub fn forward(
         config: &QwenDriveConfig,
         weights: &VisionDeviceWeights,
@@ -1133,12 +1151,22 @@ mod vision {
         pixel_values: &Tensor,
         grid_thw: &[[u32; 3]],
     ) -> Result<Tensor> {
+        let prepared = prepare(config, weights, state, ctx, pixel_values, grid_thw)?;
+        forward_device(config, weights, ctx, pixel_values, &prepared)
+    }
+    /// Run the vision tower over the concatenated per-image patch stream.
+    /// `pixel_values` is `[patches, 3 * temporal * patch * patch]` BF16 on device;
+    /// `grid_thw` holds one `[T, H, W]` entry per image.
+    pub(crate) fn prepare(
+        config: &QwenDriveConfig,
+        weights: &VisionDeviceWeights,
+        state: &super::VisionState,
+        ctx: &Context,
+        pixel_values: &Tensor,
+        grid_thw: &[[u32; 3]],
+    ) -> Result<PreparedVision> {
         let vc = &config.vision;
-        let hidden = vc.hidden_size;
-        let heads = vc.num_heads;
-        let head_dim = vc.head_dim();
         let merge = vc.spatial_merge_size;
-        let eps = 1e-6f32;
 
         let dims = pixel_values.shape().dims();
         let patch_vec = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size;
@@ -1167,88 +1195,150 @@ mod vision {
                 offsets[offsets.len() - 1]
             )));
         }
-        // TEMP-DIAG (implement_r3): vision-entry geometry; revert in the acceptance-bound revision.
-        qdiag!("[qwen_drive] vision_entry total_patches={} segments={} offsets_len={} offsets_max={} max_tokens={} heads={} head_dim={} n={} grids={:?}", total_patches, grid_thw.len(), offsets.len(), offsets.last().copied().unwrap_or(0), max_tokens, heads, head_dim, weights.blocks.len(), grid_thw);
-        // TEMP-DIAG (implement_r4): per-op elapsed-ms reference; revert in the acceptance-bound revision.
-        let vis_t0 = std::time::Instant::now();
         let offsets_dev = upload_u32(ctx, &offsets)?;
-
+        let pos_embeds = compute_pos_embeds(config, weights, state, ctx, grid_thw)?;
+        let pos_ids = compute_vision_pos_ids(grid_thw, merge);
+        let pos_ids_dev = upload_u32(ctx, &pos_ids)?;
+        Ok(PreparedVision {
+            offsets,
+            offsets_dev,
+            pos_embeds,
+            pos_ids_dev,
+            max_tokens,
+            total_patches,
+            segments: grid_thw.len(),
+        })
+    }
+    pub(crate) fn forward_device(
+        config: &QwenDriveConfig,
+        weights: &VisionDeviceWeights,
+        ctx: &Context,
+        pixel_values: &Tensor,
+        prepared: &PreparedVision,
+    ) -> Result<Tensor> {
+        let vc = &config.vision;
+        let hidden = vc.hidden_size;
+        let heads = vc.num_heads;
+        let head_dim = vc.head_dim();
+        let merge = vc.spatial_merge_size;
+        let eps = 1e-6f32;
+        let total_patches = prepared.total_patches;
+        let offsets = &prepared.offsets;
+        let offsets_dev = &prepared.offsets_dev;
+        let pos_ids_dev = &prepared.pos_ids_dev;
+        let max_tokens = prepared.max_tokens;
+        let _vision = nvtx::range("qwen_drive/vision/blocks");
         // Patch embedding: [N, patch_vec] @ [patch_vec, hidden] + bias.
         let mut x = gemm::bf16(ctx, pixel_values, &weights.patch_w)?;
         x = elementwise::bias_bf16(ctx, &x, Some(&weights.patch_b))?;
-        super::trace_rows("model_visual_patch_embed", &x)?;
 
         // Bilinear-interpolated learned position embeddings (host canonicalization).
-        let pos_embeds = compute_pos_embeds(config, weights, state, ctx, grid_thw)?;
-        x = elementwise::add(ctx, &x, &pos_embeds)?;
+        x = elementwise::add(ctx, &x, &prepared.pos_embeds)?;
 
+        let mut normalized = None;
         // 2D rope position ids in the merge-block-major patch order.
-        let pos_ids = compute_vision_pos_ids(grid_thw, merge);
-        let pos_ids_dev = upload_u32(ctx, &pos_ids)?;
-
         for (block_idx, block) in weights.blocks.iter().enumerate() {
-            // TEMP-DIAG (implement_r2, ungated in implement_r3): vision-block heartbeat every block; revert in the acceptance-bound revision.
-            qdiag!(
-                "[qwen_drive] vision_block k={} n={} ms={}",
-                block_idx,
-                weights.blocks.len(),
-                vis_t0.elapsed().as_millis()
-            );
-            let normed = norm::layer_bf16(ctx, &x, &block.norm1_w, &block.norm1_b, eps)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_norm1", &normed)?;
-            }
+            let _block = nvtx::range(&format!("qwen_drive/vision/block/{block_idx}"));
+
+            let normed = match normalized.take() {
+                Some(value) => value,
+                None => norm::layer_bf16(ctx, &x, &block.norm1_w, &block.norm1_b, eps)?,
+            };
+
             // nn.Linear adds bias before its final BF16 rounding.
             let qkv = gemm::bf16_bias(ctx, &normed, &block.qkv_w, &block.qkv_b)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_attn_qkv", &qkv)?;
-            }
-            let qkv = attention::split_vision_qkv_rope_bf16(
-                ctx,
-                &qkv,
-                None,
-                &pos_ids_dev,
-                heads,
-                head_dim,
-                10000.0,
-            )?;
-            let attn = attention::segmented_mha_bf16(
-                ctx,
-                &qkv.q,
-                &qkv.k,
-                &qkv.v,
-                &offsets_dev,
-                &offsets,
-                grid_thw.len(),
-                max_tokens,
-            )?;
+
+            const FIXED_OFFSETS: [u32; 13] = [
+                0, 624, 1248, 1872, 4072, 4696, 5320, 5944, 8144, 8768, 9392, 10016, 12216,
+            ];
+            let fixed_groups = ctx.caps().sm == 110
+                && ctx.caps().multiprocessor_count == 20
+                && total_patches == 12216
+                && heads == 16
+                && head_dim == 64
+                && prepared.segments == 12
+                && offsets.as_slice() == FIXED_OFFSETS.as_slice();
+            let direct = if fixed_groups {
+                attention::try_vision_qkv_rope_segmented_fa4_skip_v(
+                    ctx,
+                    &qkv,
+                    &pos_ids_dev,
+                    heads,
+                    head_dim,
+                    10000.0,
+                    &offsets_dev,
+                    &offsets,
+                    prepared.segments,
+                    fixed_groups,
+                )?
+            } else {
+                None
+            };
+            let attn = if let Some(output) = direct {
+                output
+            } else {
+                let qkv = attention::split_vision_qkv_rope_bf16(
+                    ctx,
+                    &qkv,
+                    None,
+                    &pos_ids_dev,
+                    heads,
+                    head_dim,
+                    10000.0,
+                )?;
+                attention::segmented_mha_bf16(
+                    ctx,
+                    &qkv.q,
+                    &qkv.k,
+                    &qkv.v,
+                    &offsets_dev,
+                    &offsets,
+                    prepared.segments,
+                    max_tokens,
+                )?
+            };
             let attn = attn.reshape(vec![total_patches, hidden])?;
             let proj = gemm::bf16_bias(ctx, &attn, &block.proj_w, &block.proj_b)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_attn", &proj)?;
-            }
-            x = elementwise::add(ctx, &x, &proj)?;
 
-            let normed = norm::layer_bf16(ctx, &x, &block.norm2_w, &block.norm2_b, eps)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_norm2", &normed)?;
-            }
-            let h = gemm::bf16_bias(ctx, &normed, &block.fc1_w, &block.fc1_b)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_mlp_linear_fc1", &h)?;
-            }
-            let h = activation::gelu_tanh(ctx, &h)?;
+            let residual_norm = fused::bias_residual_layer_bf16(
+                ctx,
+                &proj,
+                None,
+                &x,
+                &block.norm2_w,
+                &block.norm2_b,
+                eps,
+            )?;
+            x = residual_norm.hidden;
+            let normed = residual_norm.normalized;
+
+            let h = if ctx.caps().sm == 110 {
+                let h = gemm::bf16_bias_gelu_tanh(ctx, &normed, &block.fc1_w, &block.fc1_b)?;
+
+                h
+            } else {
+                let h = gemm::bf16_bias(ctx, &normed, &block.fc1_w, &block.fc1_b)?;
+
+                activation::gelu_tanh(ctx, &h)?
+            };
             let h2 = gemm::bf16_bias(ctx, &h, &block.fc2_w, &block.fc2_b)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_mlp", &h2)?;
-            }
-            x = elementwise::add(ctx, &x, &h2)?;
-            super::trace_rows(&format!("model_visual_blocks_{block_idx}"), &x)?;
+
+            let (next_w, next_b) = weights
+                .blocks
+                .get(block_idx + 1)
+                .map(|next| (&next.norm1_w, &next.norm1_b))
+                .unwrap_or((&weights.merger_norm_w, &weights.merger_norm_b));
+            let residual_norm =
+                fused::bias_residual_layer_bf16(ctx, &h2, None, &x, next_w, next_b, eps)?;
+            x = residual_norm.hidden;
+            normalized = Some(residual_norm.normalized);
         }
 
         // Merger: LayerNorm(1024) -> merge 4 rows -> fc1 -> exact erf GELU -> fc2.
-        let normed =
-            norm::layer_bf16(ctx, &x, &weights.merger_norm_w, &weights.merger_norm_b, eps)?;
+        let normed = match normalized {
+            Some(value) => value,
+            None => norm::layer_bf16(ctx, &x, &weights.merger_norm_w, &weights.merger_norm_b, eps)?,
+        };
         // Merging rows is a reshape and nothing else: the merger takes `merge*merge`
         // consecutive rows as one row of `cols * merge * merge`, which is the same
         // contiguous elements in the same order. On a GPU tensor `reshape` only
@@ -1282,31 +1372,12 @@ mod vision {
         ctx: &Context,
         grid_thw: &[[u32; 3]],
     ) -> Result<Tensor> {
-        let timed = {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var_os("APXINF_QWEN_VISION_TIMING").is_some())
-        };
-        let cached_enabled = {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                !matches!(
-                    std::env::var("APXINF_QWEN_POS_CACHE").as_deref(),
-                    Ok("0") | Ok("off") | Ok("false")
-                )
-            })
-        };
-        let started = std::time::Instant::now();
-        if cached_enabled {
+        {
             if let Ok(cache) = state.pos_embed_cache.lock() {
                 if let Some((_, tensor)) = cache.iter().find(|(key, _)| key.as_slice() == grid_thw)
                 {
                     let hit = tensor.clone();
-                    if timed {
-                        qdiag!(
-                            "[qwen_drive] pos_embed cache hit {:.2}ms",
-                            started.elapsed().as_secs_f64() * 1e3
-                        );
-                    }
+
                     return Ok(hit);
                 }
             }
@@ -1317,26 +1388,17 @@ mod vision {
         let grid_side = (vc.num_position_embeddings as f64).sqrt().round() as usize;
         // The table is a checkpoint constant, so it is read back once per model
         // rather than once per request.
-        let table_owned: Vec<f32>;
-        let table: &[f32] = if cached_enabled {
-            if state.pos_table_host.get().is_none() {
-                let values = transfers::to_cpu(&weights.pos_embed)?
-                    .to_f32_vec()
-                    .map_err(|e| Error::Other(format!("qwen_drive vision pos_embed table: {e}")))?;
-                let _ = state.pos_table_host.set(values);
-            }
-            state
-                .pos_table_host
-                .get()
-                .expect("pos_embed table is installed")
-                .as_slice()
-        } else {
-            table_owned = transfers::to_cpu(&weights.pos_embed)?
+        if state.pos_table_host.get().is_none() {
+            let values = transfers::to_cpu(&weights.pos_embed)?
                 .to_f32_vec()
                 .map_err(|e| Error::Other(format!("qwen_drive vision pos_embed table: {e}")))?;
-            table_owned.as_slice()
-        };
-        let after_readback = started.elapsed();
+            let _ = state.pos_table_host.set(values);
+        }
+        let table = state
+            .pos_table_host
+            .get()
+            .expect("pos_embed table is installed")
+            .as_slice();
         if table.len() != grid_side * grid_side * hidden {
             return Err(Error::Other(
                 "qwen_drive vision: pos_embed table shape mismatch".into(),
@@ -1385,11 +1447,10 @@ mod vision {
                 }
             }
         }
-        let after_interp = started.elapsed();
         let rounded: Vec<half::bf16> = out.iter().map(|&v| half::bf16::from_f32(v)).collect();
         let tensor = Tensor::from_bf16(vec![total, hidden], &rounded)?;
         let uploaded = transfers::to_cuda(&tensor, ctx.device_id());
-        if cached_enabled {
+        {
             if let (Ok(value), Ok(mut cache)) = (uploaded.as_ref(), state.pos_embed_cache.lock()) {
                 // A rig presents a handful of grids; keep the cache small rather
                 // than letting an unexpected stream of shapes grow it without end.
@@ -1400,17 +1461,7 @@ mod vision {
                 cache.push((grid_thw.to_vec(), value.clone()));
             }
         }
-        if timed {
-            qdiag!(
-            "[qwen_drive] pos_embed total={:.1}ms readback={:.1}ms interp={:.1}ms round+upload={:.1}ms tokens={} hidden={}",
-            started.elapsed().as_secs_f64() * 1e3,
-            after_readback.as_secs_f64() * 1e3,
-            (after_interp - after_readback).as_secs_f64() * 1e3,
-            (started.elapsed() - after_interp).as_secs_f64() * 1e3,
-            total,
-            hidden
-        );
-        }
+
         uploaded
     }
 
@@ -1439,10 +1490,13 @@ mod vision {
     }
 }
 pub(crate) mod expert {
+    use super::FIXED_SCENE_TOKENS;
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
-    use crate::qwen_drive::backend::{kernels, transfers, Context, DeviceBuffer};
-    use kernels::{activation, elementwise, embedding, gemm, linear_attention as la, norm};
+    use crate::qwen_drive::backend::{kernels, nvtx, transfers, Context, DeviceBuffer};
+    use kernels::{
+        activation, attention, elementwise, embedding, fused, gemm, linear_attention as la, norm,
+    };
 
     use crate::qwen_drive::config::{PlanningExpertConfig, QwenDriveConfig};
     use crate::qwen_drive::inputs::ExpertConditioning;
@@ -1450,12 +1504,6 @@ pub(crate) mod expert {
 
     // The expert has only one token per waypoint, so bounded opt-in diagnostics
     // can retain every row instead of sampling the much larger VLM sequence.
-    fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
-        if std::env::var_os("APXINF_QWEN_TRACE_DIR").is_none() {
-            return Ok(());
-        }
-        super::trace_rows(name, &tensor.reshape(vec![1, tensor.numel()])?)
-    }
 
     /// bf16 rounding of one f32 value, returned as f32 (the value a bf16 tensor
     /// would hold). Mirrors the scaffold's semantic-rounding helper.
@@ -1594,7 +1642,7 @@ pub(crate) mod expert {
 
     /// Inputs for one expert planning call. `scene` holds one `(K, V)` pair per
     /// expert KV source (VLM full-attention layers, post-rotary, bf16
-    /// `[scene_len, kv_heads, head_dim]` on device).
+    /// `[capacity + planner_len, kv_heads, head_dim]` on device).
     pub struct ExpertPlan<'a> {
         pub scene: &'a [(Tensor, Tensor)],
         pub scene_len: usize,
@@ -1604,47 +1652,153 @@ pub(crate) mod expert {
         pub num_steps: usize,
     }
 
+    struct JointKv {
+        key: Tensor,
+        value: Tensor,
+        split_key: Option<Tensor>,
+        split_value: Option<Tensor>,
+        key_suffix: Tensor,
+        value_suffix: Tensor,
+    }
+
+    // Request-local values, regenerated inside prepare_device on every graph
+    // replay. They depend on time/nav/ego, never on the evolving waypoints.
+    struct BatchedModulation {
+        time_conditions: Vec<Tensor>,
+        layers: Vec<Tensor>, // Each is [steps, 6 * hidden_size].
+    }
+
+    fn bf16_row(tensor: &Tensor, index: usize) -> Result<Tensor> {
+        let dims = tensor.shape().dims();
+        if tensor.dtype() != DType::BF16 || dims.len() != 2 || dims[1] == 0 || index >= dims[0] {
+            return Err(Error::Other(
+                "qwen_drive expert: invalid BF16 row view".into(),
+            ));
+        }
+        let bytes = dims[1]
+            .checked_mul(DType::BF16.size_in_bytes())
+            .ok_or_else(|| Error::Other("qwen_drive expert: row size overflow".into()))?;
+        let offset = index
+            .checked_mul(bytes)
+            .ok_or_else(|| Error::Other("qwen_drive expert: row offset overflow".into()))?;
+        DeviceBuffer::from_tensor(tensor)
+            .map_err(Error::Cuda)?
+            .view(offset, bytes)
+            .map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![1, dims[1]]), DType::BF16)
+            .map_err(Error::Cuda)
+    }
+
+    fn prepare_batched_modulation(
+        ctx: &Context,
+        weights: &ExpertDeviceWeights,
+        time_embeddings: &Tensor,
+        nav_out: &Tensor,
+        ego_out: &Tensor,
+        hidden_size: usize,
+        steps: usize,
+    ) -> Result<BatchedModulation> {
+        i32::try_from(steps)
+            .map_err(|_| Error::Other("qwen_drive expert: step count overflow".into()))?;
+        let row_bytes = hidden_size
+            .checked_mul(DType::BF16.size_in_bytes())
+            .ok_or_else(|| Error::Other("qwen_drive expert: condition size overflow".into()))?;
+        let bytes = steps
+            .checked_mul(row_bytes)
+            .ok_or_else(|| Error::Other("qwen_drive expert: condition batch overflow".into()))?;
+        let time_shape = time_embeddings.shape().dims();
+        if steps == 0 || hidden_size == 0 || time_shape.len() != 2 || time_shape[0] != steps {
+            return Err(Error::Other(
+                "qwen_drive expert: invalid condition batch shape".into(),
+            ));
+        }
+        let conditions_buffer = kernels::scratch_buffer(ctx, bytes)?;
+        let conditions = conditions_buffer
+            .as_tensor(Shape::new(vec![steps, hidden_size]), DType::BF16)
+            .map_err(Error::Cuda)?;
+        let mut time_conditions = Vec::with_capacity(steps);
+        for index in 0..steps {
+            let time_embedding = bf16_row(time_embeddings, index)?;
+            // Preserve every existing MLP, add and SiLU BF16 boundary. Only
+            // the following modulation projections are batched over steps.
+            let time_condition = mlp(ctx, &weights.time_mlp, &time_embedding)?;
+            let condition = elementwise::add(ctx, &time_condition, nav_out)?;
+            let condition = elementwise::add(ctx, &condition, ego_out)?;
+            let condition_silu = activation::silu(ctx, &condition)?;
+            if condition_silu.dtype() != DType::BF16
+                || condition_silu.shape().dims() != [1, hidden_size]
+            {
+                return Err(Error::Other(
+                    "qwen_drive expert: condition row shape mismatch".into(),
+                ));
+            }
+            let source = DeviceBuffer::from_tensor(&condition_silu).map_err(Error::Cuda)?;
+            conditions_buffer
+                .view(index * row_bytes, row_bytes)
+                .map_err(Error::Cuda)?
+                .copy_from_device_async(&source, row_bytes, ctx.stream())
+                .map_err(Error::Cuda)?;
+            time_conditions.push(time_condition);
+        }
+        let modulation_width = hidden_size
+            .checked_mul(6)
+            .ok_or_else(|| Error::Other("qwen_drive expert: modulation width overflow".into()))?;
+        let mut layers = Vec::with_capacity(weights.layers.len());
+        for layer in &weights.layers {
+            if layer.modulation_w.shape().dims() != [modulation_width, hidden_size]
+                || layer.modulation_b.shape().dims() != [modulation_width]
+            {
+                return Err(Error::Other(
+                    "qwen_drive expert: modulation weight shape mismatch".into(),
+                ));
+            }
+            layers.push(gemm::bf16_addmm_checkpoint(
+                ctx,
+                &layer.modulation_w,
+                &conditions,
+                &layer.modulation_b,
+            )?);
+        }
+        Ok(BatchedModulation {
+            time_conditions,
+            layers,
+        })
+    }
+
     pub(crate) struct ExpertState {
+        // One joint cache per scene source. Layers sharing a source execute on
+        // the same stream and overwrite only the trajectory suffix.
+        joint_kv: Vec<JointKv>,
         pose_q: Tensor,
         velocity_q: Tensor,
         acceleration_q: Tensor,
-        nav_out: Tensor,
-        ego_out: Tensor,
         wp_idx: Tensor,
         cos_t: Tensor,
         sin_t: Tensor,
         waypoints: Tensor,
-        time_buffer: DeviceBuffer,
-        time_row_bytes: usize,
+        batched_modulation: BatchedModulation,
         step_f64: f64,
     }
-    pub(crate) fn prepare(
+    pub(crate) struct PreparedInputs {
+        history_t: Tensor,
+        velocity_t: Tensor,
+        acceleration_t: Tensor,
+        ego_t: Tensor,
+        nav_t: Tensor,
+        ids_dev: DeviceBuffer,
+        cos_t: Tensor,
+        sin_t: Tensor,
+        times: Tensor,
+    }
+    pub(crate) fn prepare_inputs(
         config: &QwenDriveConfig,
-        weights: &ExpertDeviceWeights,
         ctx: &Context,
-        input: &ExpertPlan,
-    ) -> Result<ExpertState> {
+        input: &ExpertPlan<'_>,
+    ) -> Result<PreparedInputs> {
         let ec = &config.expert;
         let length = config.num_future_points;
-        let point_dim = config.trajectory_point_dim;
         let rotary_dim = ec.rotary_dim();
         let steps = input.num_steps.max(1);
-        if input.scene.len() != ec.num_kv_sources() {
-            return Err(Error::Other(format!(
-                "qwen_drive expert: {} scene caches, expected {}",
-                input.scene.len(),
-                ec.num_kv_sources()
-            )));
-        }
-        if input.noise.numel() != length * point_dim {
-            return Err(Error::Other(format!(
-                "qwen_drive expert: noise has {} values, expected {}",
-                input.noise.numel(),
-                length * point_dim
-            )));
-        }
-        input.cond.validate(config)?;
-
         // Conditioning (request lifetime).
         let nav = one_hot(ec.nav_command_classes, input.cond.nav_command);
         let mut history_in = input.cond.history.clone();
@@ -1666,28 +1820,187 @@ pub(crate) mod expert {
             vec![1, input.cond.ego_status.len()],
         )?;
         let nav_t = bf16_tensor(ctx, &nav, vec![1, nav.len()])?;
+        let ids: Vec<u32> = (0..length as u32).collect();
+        let ids_dev = upload_u32(ctx, &ids)?;
+
+        let (cos, sin) = waypoint_rope_tables(ec, input.anchor, length)?;
+        let cos_t = bf16_tensor(ctx, &cos, vec![length, rotary_dim])?;
+        let sin_t = bf16_tensor(ctx, &sin, vec![length, rotary_dim])?;
+
+        let step_f64 = 1.0f64 / steps as f64;
+        let times: Vec<f32> = (0..steps).map(|i| (i as f64 * step_f64) as f32).collect();
+        let times = transfers::to_cuda(&Tensor::from_f32(vec![steps], &times)?, ctx.device_id())?;
+        Ok(PreparedInputs {
+            history_t,
+            velocity_t,
+            acceleration_t,
+            ego_t,
+            nav_t,
+            ids_dev,
+            cos_t,
+            sin_t,
+            times,
+        })
+    }
+    impl PreparedInputs {
+        pub(crate) fn update_conditioning(
+            &self,
+            config: &QwenDriveConfig,
+            cond: &ExpertConditioning,
+        ) -> Result<()> {
+            cond.validate(config)?;
+            let nav = one_hot(config.expert.nav_command_classes, cond.nav_command);
+            let mut history = cond.history.clone();
+            history.extend_from_slice(&nav);
+            for (values, destination) in [
+                (&history, &self.history_t),
+                (&cond.history_velocity, &self.velocity_t),
+                (&cond.history_acceleration, &self.acceleration_t),
+                (&cond.ego_status, &self.ego_t),
+                (&nav, &self.nav_t),
+            ] {
+                let values: Vec<half::bf16> =
+                    values.iter().map(|&x| half::bf16::from_f32(x)).collect();
+                transfers::copy_cpu_to_cuda(
+                    &Tensor::from_bf16(destination.shape().dims().to_vec(), &values)?,
+                    destination,
+                )?;
+            }
+            Ok(())
+        }
+    }
+    pub(crate) fn prepare(
+        config: &QwenDriveConfig,
+        weights: &ExpertDeviceWeights,
+        ctx: &Context,
+        input: &ExpertPlan<'_>,
+    ) -> Result<ExpertState> {
+        let prepared = prepare_inputs(config, ctx, input)?;
+        prepare_device(config, weights, ctx, input, &prepared)
+    }
+    pub(crate) fn prepare_device(
+        config: &QwenDriveConfig,
+        weights: &ExpertDeviceWeights,
+        ctx: &Context,
+        input: &ExpertPlan,
+        prepared: &PreparedInputs,
+    ) -> Result<ExpertState> {
+        let ec = &config.expert;
+        let length = config.num_future_points;
+        let point_dim = config.trajectory_point_dim;
+        let steps = input.num_steps.max(1);
+        if input.scene.len() != ec.num_kv_sources() {
+            return Err(Error::Other(format!(
+                "qwen_drive expert: {} scene caches, expected {}",
+                input.scene.len(),
+                ec.num_kv_sources()
+            )));
+        }
+        if input.noise.numel() != length * point_dim {
+            return Err(Error::Other(format!(
+                "qwen_drive expert: noise has {} values, expected {}",
+                input.noise.numel(),
+                length * point_dim
+            )));
+        }
+        input.cond.validate(config)?;
+
+        // Backbone and planner share one allocation. The prefix was written by
+        // language prefill; expert QKV writes only its reserved suffix.
+        let mut joint_kv = Vec::with_capacity(input.scene.len());
+        let row_bytes = ec.n_kv_heads * ec.head_dim * DType::BF16.size_in_bytes();
+        let split_geometry = (3383..=FIXED_SCENE_TOKENS).contains(&input.scene_len)
+            && length == 50
+            && ec.n_kv_heads == 4
+            && ec.head_dim == 256;
+        for (scene_k, scene_v) in input.scene {
+            let views = |scene: &Tensor| -> Result<(Tensor, Tensor)> {
+                let buffer = DeviceBuffer::from_tensor(scene).map_err(Error::Cuda)?;
+                let key = buffer
+                    .view(0, (input.scene_len + length) * row_bytes)
+                    .map_err(Error::Cuda)?
+                    .as_tensor(
+                        Shape::new(vec![input.scene_len + length, ec.n_kv_heads, ec.head_dim]),
+                        DType::BF16,
+                    )
+                    .map_err(Error::Cuda)?;
+                let suffix = buffer
+                    .view(input.scene_len * row_bytes, length * row_bytes)
+                    .map_err(Error::Cuda)?
+                    .as_tensor(
+                        Shape::new(vec![length, ec.n_kv_heads, ec.head_dim]),
+                        DType::BF16,
+                    )
+                    .map_err(Error::Cuda)?;
+                Ok((key, suffix))
+            };
+            let (key, key_suffix) = views(scene_k)?;
+            let (value, value_suffix) = views(scene_v)?;
+            // Split attention sees a fixed 3438-row allocation. Its masks
+            // exclude rows beyond the real prompt and action suffix.
+            let split_views = if split_geometry {
+                let k = DeviceBuffer::from_tensor(scene_k).map_err(Error::Cuda)?;
+                let v = DeviceBuffer::from_tensor(scene_v).map_err(Error::Cuda)?;
+                let physical_rows = (FIXED_SCENE_TOKENS + length + 1) / 2 * 2;
+                let physical_bytes = physical_rows * row_bytes;
+                let used_bytes = (input.scene_len + length) * row_bytes;
+                let tail_bytes = physical_bytes - used_bytes;
+                if k.len() >= physical_bytes && v.len() >= physical_bytes {
+                    // This write belongs to every request's captured graph. A
+                    // prior request may have dirtied the reserved tail row.
+                    k.view(used_bytes, tail_bytes)
+                        .map_err(Error::Cuda)?
+                        .memset_async(0, tail_bytes, ctx.stream())
+                        .map_err(Error::Cuda)?;
+                    v.view(used_bytes, tail_bytes)
+                        .map_err(Error::Cuda)?
+                        .memset_async(0, tail_bytes, ctx.stream())
+                        .map_err(Error::Cuda)?;
+                    let shape = Shape::new(vec![physical_rows, ec.n_kv_heads, ec.head_dim]);
+                    (
+                        Some(
+                            k.view(0, physical_bytes)
+                                .map_err(Error::Cuda)?
+                                .as_tensor(shape.clone(), DType::BF16)
+                                .map_err(Error::Cuda)?,
+                        ),
+                        Some(
+                            v.view(0, physical_bytes)
+                                .map_err(Error::Cuda)?
+                                .as_tensor(shape, DType::BF16)
+                                .map_err(Error::Cuda)?,
+                        ),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+            joint_kv.push(JointKv {
+                key,
+                value,
+                split_key: split_views.0,
+                split_value: split_views.1,
+                key_suffix,
+                value_suffix,
+            });
+        }
+
+        let history_t = &prepared.history_t;
+        let velocity_t = &prepared.velocity_t;
+        let acceleration_t = &prepared.acceleration_t;
+        let ego_t = &prepared.ego_t;
+        let nav_t = &prepared.nav_t;
         let pose_q = mlp(ctx, &weights.history_encoder, &history_t)?;
         let velocity_q = mlp(ctx, &weights.history_velocity_encoder, &velocity_t)?;
         let acceleration_q = mlp(ctx, &weights.history_acceleration_encoder, &acceleration_t)?;
         let nav_out = mlp(ctx, &weights.nav_mlp, &nav_t)?;
         let ego_out = mlp(ctx, &weights.ego_mlp, &ego_t)?;
-        for (name, value) in [
-            ("history_encoder", &pose_q),
-            ("history_velocity_encoder", &velocity_q),
-            ("history_acceleration_encoder", &acceleration_q),
-            ("nav_mlp", &nav_out),
-            ("ego_mlp", &ego_out),
-        ] {
-            trace_rows(&format!("expert_{name}"), value)?;
-        }
 
-        let ids: Vec<u32> = (0..length as u32).collect();
-        let ids_dev = upload_u32(ctx, &ids)?;
-        let wp_idx = embedding::lookup(ctx, &weights.waypoint_embed, &ids_dev, length)?;
-
-        let (cos, sin) = waypoint_rope_tables(ec, input.anchor, length)?;
-        let cos_t = bf16_tensor(ctx, &cos, vec![length, rotary_dim])?;
-        let sin_t = bf16_tensor(ctx, &sin, vec![length, rotary_dim])?;
+        let wp_idx = embedding::lookup(ctx, &weights.waypoint_embed, &prepared.ids_dev, length)?;
+        let cos_t = prepared.cos_t.clone();
+        let sin_t = prepared.sin_t.clone();
 
         // fp32 solver state on device.
         let waypoints = device_tensor(ctx, &[length, point_dim], DType::F32)?;
@@ -1698,25 +2011,29 @@ pub(crate) mod expert {
             .map_err(Error::Cuda)?;
 
         let step_f64 = 1.0f64 / steps as f64;
-        let times: Vec<f32> = (0..steps).map(|i| (i as f64 * step_f64) as f32).collect();
-        let times = transfers::to_cuda(&Tensor::from_f32(vec![steps], &times)?, ctx.device_id())?;
+        let times = &prepared.times;
         let decay = ((10000.0f64).ln() / ((ec.time_embed_dim / 2).max(2) - 1) as f64) as f32;
         let time_embeddings =
             embedding::sinusoidal_bf16(ctx, &times, ec.time_embed_dim, ec.time_embed_scale, decay)?;
-        let time_buffer = DeviceBuffer::from_tensor(&time_embeddings).map_err(Error::Cuda)?;
-        let time_row_bytes = ec.time_embed_dim * DType::BF16.size_in_bytes();
+        let batched_modulation = prepare_batched_modulation(
+            ctx,
+            weights,
+            &time_embeddings,
+            &nav_out,
+            &ego_out,
+            ec.hidden_size,
+            steps,
+        )?;
         Ok(ExpertState {
+            joint_kv,
             pose_q,
             velocity_q,
             acceleration_q,
-            nav_out,
-            ego_out,
             wp_idx,
             cos_t,
             sin_t,
             waypoints,
-            time_buffer,
-            time_row_bytes,
+            batched_modulation,
             step_f64,
         })
     }
@@ -1728,6 +2045,7 @@ pub(crate) mod expert {
         state: &ExpertState,
         index: usize,
     ) -> Result<()> {
+        let _step = nvtx::range(&format!("qwen_drive/planner/step/{index}"));
         let ec = &config.expert;
         let hidden_size = ec.hidden_size;
         let length = config.num_future_points;
@@ -1737,39 +2055,23 @@ pub(crate) mod expert {
         let head_dim = ec.head_dim;
         let rotary_dim = ec.rotary_dim();
         let eps = ec.rms_norm_eps;
-        let trace_layer = std::env::var("APXINF_QWEN_EXPERT_TRACE_LAYER")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let trace_step = std::env::var("APXINF_QWEN_EXPERT_TRACE_STEP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
         let pose_q = &state.pose_q;
         let velocity_q = &state.velocity_q;
         let acceleration_q = &state.acceleration_q;
-        let nav_out = &state.nav_out;
-        let ego_out = &state.ego_out;
         let wp_idx = &state.wp_idx;
         let cos_t = &state.cos_t;
         let sin_t = &state.sin_t;
         let waypoints = &state.waypoints;
-        let time_buffer = &state.time_buffer;
-        let time_row_bytes = state.time_row_bytes;
         let step_f64 = state.step_f64;
 
         let t_f64 = index as f64 * step_f64;
-        let t_emb_t = time_buffer
-            .view(index * time_row_bytes, time_row_bytes)
-            .map_err(Error::Cuda)?
-            .as_tensor(Shape::new(vec![1, ec.time_embed_dim]), DType::BF16)
-            .map_err(Error::Cuda)?;
-        let time_condition = mlp(ctx, &weights.time_mlp, &t_emb_t)?;
-        let condition = elementwise::add(ctx, &time_condition, &nav_out)?;
-        let condition = elementwise::add(ctx, &condition, &ego_out)?;
-        let condition_silu = activation::silu(ctx, &condition)?;
-        trace_rows(&format!("expert_time_embed_{index}"), &t_emb_t)?;
-        trace_rows(&format!("expert_time_condition_{index}"), &time_condition)?;
+        let time_condition = state
+            .batched_modulation
+            .time_conditions
+            .get(index)
+            .ok_or_else(|| {
+                Error::Other("qwen_drive expert: modulation step index out of range".into())
+            })?;
 
         let wp_bf16 = device_tensor(ctx, &[length, point_dim], DType::BF16)?;
         la::cast_f32_to_bf16(ctx, &waypoints, &wp_bf16)?;
@@ -1787,10 +2089,7 @@ pub(crate) mod expert {
             ec.fourier_num_features,
         )?;
         let fourier = mlp(ctx, &weights.fourier, &fourier_feat)?;
-        if index == trace_step {
-            trace_rows("expert_trajectory_proj", &traj)?;
-            trace_rows("expert_fourier_encoder", &fourier)?;
-        }
+
         // broadcast bits: time(2), pose(3), velocity(5), acceleration(6).
         let fused = la::concat7_cols(
             ctx,
@@ -1806,19 +2105,18 @@ pub(crate) mod expert {
             (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6),
         )?;
         let mut hidden = mlp(ctx, &weights.query_fusion, &fused)?;
-        if index == trace_step {
-            trace_rows("expert_query_fusion", &hidden)?;
-        }
 
+        let modulations = state
+            .batched_modulation
+            .layers
+            .iter()
+            .map(|layer| bf16_row(layer, index))
+            .collect::<Result<Vec<_>>>()?;
+        let mut normalized = None;
         for (layer_index, layer) in weights.layers.iter().enumerate() {
-            let (scene_k, scene_v) = &input.scene[layer_index / ec.layers_per_kv];
-            let modulation = gemm::bf16_addmv(
-                ctx,
-                &layer.modulation_w,
-                &condition_silu.reshape(vec![hidden_size])?,
-                &layer.modulation_b,
-            )?
-            .reshape(vec![1, 6 * hidden_size])?;
+            let _block = nvtx::range(&format!("qwen_drive/planner/block/{layer_index}"));
+            let joint = &state.joint_kv[layer_index / ec.layers_per_kv];
+            let modulation = &modulations[layer_index];
             let shift_attn = row_col_slice(&modulation, 0, hidden_size)?;
             let scale_attn = row_col_slice(&modulation, hidden_size, hidden_size)?;
             let gate_attn = row_col_slice(&modulation, 2 * hidden_size, hidden_size)?;
@@ -1826,24 +2124,21 @@ pub(crate) mod expert {
             let scale_ffn = row_col_slice(&modulation, 4 * hidden_size, hidden_size)?;
             let gate_ffn = row_col_slice(&modulation, 5 * hidden_size, hidden_size)?;
 
-            let x = la::adaln_rms_norm(
-                ctx,
-                &hidden,
-                &layer.input_norm,
-                &scale_attn,
-                &shift_attn,
-                eps,
-            )?;
+            let x = match normalized.take() {
+                Some(value) => value,
+                None => la::adaln_rms_norm(
+                    ctx,
+                    &hidden,
+                    &layer.input_norm,
+                    &scale_attn,
+                    &shift_attn,
+                    eps,
+                )?,
+            };
             let qkv = gemm::bf16(ctx, &x, &layer.qkv_w)?;
-            if index == trace_step && layer_index == trace_layer {
-                trace_rows("expert_modulation", &modulation)?;
-                trace_rows("expert_adaln_input", &x)?;
-                trace_rows("expert_qkv", &qkv)?;
-            }
+
             let q_out = device_tensor(ctx, &[length, heads, head_dim], DType::BF16)?;
             let gate_out = device_tensor(ctx, &[length, heads, head_dim], DType::BF16)?;
-            let k_out = device_tensor(ctx, &[length, kv_heads, head_dim], DType::BF16)?;
-            let v_out = device_tensor(ctx, &[length, kv_heads, head_dim], DType::BF16)?;
             la::expert_qkv_prepare(
                 ctx,
                 &qkv,
@@ -1853,79 +2148,302 @@ pub(crate) mod expert {
                 &sin_t,
                 &q_out,
                 &gate_out,
-                &k_out,
-                &v_out,
+                &joint.key_suffix,
+                &joint.value_suffix,
                 heads,
                 kv_heads,
                 head_dim,
                 rotary_dim,
                 eps,
             )?;
-            let k_cat = elementwise::concat_rows_bf16(
-                ctx,
-                &scene_k.reshape(vec![input.scene_len, kv_heads * head_dim])?,
-                &k_out.reshape(vec![length, kv_heads * head_dim])?,
-            )?;
-            let v_cat = elementwise::concat_rows_bf16(
-                ctx,
-                &scene_v.reshape(vec![input.scene_len, kv_heads * head_dim])?,
-                &v_out.reshape(vec![length, kv_heads * head_dim])?,
-            )?;
-            let k_cat = k_cat.reshape(vec![input.scene_len + length, kv_heads, head_dim])?;
-            let v_cat = v_cat.reshape(vec![input.scene_len + length, kv_heads, head_dim])?;
-            let attn = la::gqa_bf16(ctx, &q_out, &k_cat, &v_cat, input.scene_len + length)?;
-            if index == trace_step && layer_index == trace_layer {
-                trace_rows("expert_q", &q_out.reshape(vec![length, heads * head_dim])?)?;
-                trace_rows(
-                    "expert_attention",
-                    &attn.reshape(vec![length, heads * head_dim])?,
-                )?;
-            }
+            let split = match (&joint.split_key, &joint.split_value) {
+                (Some(k), Some(v)) => attention::try_gqa_bf16_fa4_d256_splitbatch_sm110(
+                    ctx,
+                    &q_out,
+                    k,
+                    v,
+                    input.scene_len + length,
+                )?,
+                _ => None,
+            };
+            let attn = match split {
+                Some(output) => output,
+                None => la::gqa_bf16(
+                    ctx,
+                    &q_out,
+                    &joint.key,
+                    &joint.value,
+                    input.scene_len + length,
+                )?,
+            };
+
             la::expert_sigmoid_gate_mul(ctx, &attn, &gate_out)?;
             let attn = attn.reshape(vec![length, heads * head_dim])?;
             let proj = gemm::bf16(ctx, &attn, &layer.o_w)?;
-            if index == trace_step && layer_index == trace_layer {
-                trace_rows("expert_o_proj", &proj)?;
-            }
-            hidden = la::adaln_gate_residual(ctx, &proj, &hidden, &gate_attn)?;
 
-            let x2 =
-                la::adaln_rms_norm(ctx, &hidden, &layer.post_norm, &scale_ffn, &shift_ffn, eps)?;
+            let residual_norm = fused::adaln_gate_residual_rms_bf16(
+                ctx,
+                &proj,
+                &hidden,
+                &gate_attn,
+                &layer.post_norm,
+                &scale_ffn,
+                &shift_ffn,
+                eps,
+            )?;
+            hidden = residual_norm.hidden;
+            let x2 = residual_norm.normalized;
             let gu = gemm::bf16(ctx, &x2, &layer.gate_up_w)?;
             let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
             let down = gemm::bf16(ctx, &act, &layer.down_w)?;
-            if index == trace_step && layer_index == trace_layer {
-                trace_rows("expert_adaln_ffn", &x2)?;
-                trace_rows("expert_gate_up", &gu)?;
-                trace_rows("expert_down", &down)?;
-            }
-            hidden = la::adaln_gate_residual(ctx, &down, &hidden, &gate_ffn)?;
-            if index == trace_step {
-                trace_rows(&format!("expert_layer_{layer_index}"), &hidden)?;
+
+            if let Some(next) = weights.layers.get(layer_index + 1) {
+                let next_shift = row_col_slice(&modulations[layer_index + 1], 0, hidden_size)?;
+                let next_scale =
+                    row_col_slice(&modulations[layer_index + 1], hidden_size, hidden_size)?;
+                let residual_norm = fused::adaln_gate_residual_rms_bf16(
+                    ctx,
+                    &down,
+                    &hidden,
+                    &gate_ffn,
+                    &next.input_norm,
+                    &next_scale,
+                    &next_shift,
+                    eps,
+                )?;
+                hidden = residual_norm.hidden;
+                normalized = Some(residual_norm.normalized);
+            } else {
+                hidden = la::adaln_gate_residual(ctx, &down, &hidden, &gate_ffn)?;
             }
         }
 
         let final_normed = norm::rms_bf16(ctx, &hidden, &weights.final_norm, eps)?;
-        if index == trace_step {
-            trace_rows("expert_final_norm", &final_normed)?;
-        }
+
         let endpoint =
             gemm::bf16_bias(ctx, &final_normed, &weights.out_proj_w, &weights.out_proj_b)?;
         let endpoint_f32 = device_tensor(ctx, &[length, point_dim], DType::F32)?;
-        trace_rows(
-            &format!("expert_endpoint_{index}"),
-            &endpoint.reshape(vec![1, length * point_dim])?,
-        )?;
+
         la::cast_bf16_to_f32(ctx, &endpoint, &endpoint_f32)?;
         let remaining = (1.0f64 - t_f64).max(config.min_one_minus_t as f64) as f32;
         la::flow_update(ctx, &waypoints, &endpoint_f32, remaining, step_f64 as f32)?;
-        trace_rows(
-            &format!("expert_waypoints_{index}"),
-            &waypoints.reshape(vec![1, length * point_dim])?,
-        )?;
+
         Ok(())
     }
     pub(crate) fn output(state: ExpertState) -> Tensor {
         state.waypoints
+    }
+}
+
+pub(crate) struct DirectInputs {
+    pub pixels: Tensor,
+    pub rgb: Option<RawRgbInput>,
+    pub tokens: DeviceBuffer,
+    pub noise: Tensor,
+    rows: DeviceBuffer,
+    cos: Tensor,
+    sin: Tensor,
+    vision: vision::PreparedVision,
+    visual_output: Tensor,
+    expert: expert::PreparedInputs,
+    conditioning_shape: ExpertConditioning,
+    scene: Vec<(Tensor, Tensor)>,
+    token_count: usize,
+    prompt_len: usize,
+    anchor: i64,
+    steps: usize,
+}
+
+/// Stable captured input addresses and frame geometry for resized RGB mode.
+pub(crate) struct RawRgbInput {
+    pub bytes: DeviceBuffer,
+    pub lut: DeviceBuffer,
+    pub frames: Vec<kernels::preprocess::RgbRectFrame>,
+    pub resize: Option<kernels::pillow_bicubic::PillowBicubicRgbPlan>,
+}
+
+fn tensor(ctx: &Context, shape: &[usize], dtype: DType) -> Result<Tensor> {
+    let bytes = shape
+        .iter()
+        .try_fold(dtype.size_in_bytes(), |n, &d| n.checked_mul(d))
+        .ok_or_else(|| Error::Other("qwen_drive direct input size overflow".into()))?;
+    DeviceBuffer::alloc(bytes, ctx.device_id())
+        .map_err(Error::Cuda)?
+        .as_tensor(Shape::new(shape.to_vec()), dtype)
+        .map_err(Error::Cuda)
+}
+fn copy(ctx: &Context, dst: &Tensor, src: &Tensor) -> Result<()> {
+    DeviceBuffer::from_tensor(dst)
+        .map_err(Error::Cuda)?
+        .copy_from_device_async(
+            &DeviceBuffer::from_tensor(src).map_err(Error::Cuda)?,
+            src.numel() * src.dtype().size_in_bytes(),
+            ctx.stream(),
+        )
+        .map_err(Error::Cuda)
+}
+impl DirectInputs {
+    pub(crate) fn new(
+        b: &BackboneBf16,
+        p: &PlannerBf16,
+        state: &mut BackboneState,
+        vision_state: &VisionState,
+        token_ids: &[u32],
+        prompt_len: usize,
+        pixels: &Tensor,
+        grids: &[[u32; 3]],
+        cond: ExpertConditioning,
+        steps: usize,
+    ) -> Result<Self> {
+        let ctx = b.ctx();
+        let positions = b.rope_index(token_ids, grids)?;
+        let last = positions
+            .get(prompt_len - 1)
+            .ok_or_else(|| Error::Other("qwen_drive empty prompt".into()))?;
+        let anchor = *last.iter().max().unwrap() as i64;
+        let (cos, sin) = b.mrope_tables(&positions)?;
+        let mut ordinal = 0;
+        let rows: Vec<u32> = token_ids
+            .iter()
+            .map(|&id| {
+                if id == b.config.image_token_id {
+                    let row = ordinal;
+                    ordinal += 1;
+                    row
+                } else {
+                    u32::MAX
+                }
+            })
+            .collect();
+        let merged_rows: usize = grids
+            .iter()
+            .map(|g| g.iter().map(|&x| x as usize).product::<usize>())
+            .sum::<usize>()
+            / b.config.vision.spatial_merge_size.pow(2);
+        if ordinal as usize != merged_rows {
+            return Err(Error::Other(
+                "qwen_drive image token / vision row mismatch".into(),
+            ));
+        }
+        let scene = b.scene_caches(state)?;
+        let noise = tensor(
+            ctx,
+            &[b.config.num_future_points, b.config.trajectory_point_dim],
+            DType::F32,
+        )?;
+        let plan = expert::ExpertPlan {
+            scene: &scene,
+            scene_len: prompt_len,
+            anchor,
+            cond: &cond,
+            noise: &noise,
+            num_steps: steps,
+        };
+        let expert = expert::prepare_inputs(&p.config, ctx, &plan)?;
+        let vision = vision::prepare(
+            &b.config,
+            &b.weights.vision,
+            vision_state,
+            ctx,
+            pixels,
+            grids,
+        )?;
+        Ok(Self {
+            pixels: tensor(ctx, pixels.shape().dims(), pixels.dtype())?,
+            rgb: None,
+            tokens: upload_u32(ctx, token_ids)?,
+            noise,
+            rows: upload_u32(ctx, &rows)?,
+            cos,
+            sin,
+            vision,
+            visual_output: tensor(ctx, &[merged_rows, b.config.text.hidden_size], DType::BF16)?,
+            expert,
+            conditioning_shape: cond,
+            scene,
+            token_count: token_ids.len(),
+            prompt_len,
+            anchor,
+            steps,
+        })
+    }
+    pub(crate) fn update_conditioning(
+        &self,
+        config: &crate::qwen_drive::config::QwenDriveConfig,
+        cond: &ExpertConditioning,
+    ) -> Result<()> {
+        self.expert.update_conditioning(config, cond)
+    }
+    pub(crate) fn forward(
+        &self,
+        b: &BackboneBf16,
+        p: &PlannerBf16,
+        state: &mut BackboneState,
+        execution: &mut dyn DirectExecution,
+    ) -> Result<Tensor> {
+        let ctx = b.ctx();
+        // Reset is part of the captured graph, so every replay starts a new request.
+        b.reset_state(state)?;
+        execution.run(&mut || {
+            let _stage = nvtx::range("qwen_drive/vision");
+            let pixels = if let Some(rgb) = &self.rgb {
+                if let Some(resize) = &rgb.resize {
+                    resize.run(ctx)?;
+                }
+                let rgb_buffer = rgb
+                    .resize
+                    .as_ref()
+                    .map(|resize| resize.final_rgb())
+                    .unwrap_or(&rgb.bytes);
+                kernels::preprocess::rgb_u8_to_temporal2_merge2_rect_bf16(
+                    ctx,
+                    rgb_buffer,
+                    &self.pixels,
+                    &rgb.lut,
+                    &rgb.frames,
+                )?;
+                self.pixels.clone()
+            } else {
+                b.upload_pixels(&self.pixels)?
+            };
+            let features =
+                vision::forward_device(&b.config, &b.weights.vision, ctx, &pixels, &self.vision)?;
+            copy(ctx, &self.visual_output, &features)?;
+            Ok(self.visual_output.clone())
+        })?;
+        execution.run(&mut || {
+            let _stage = nvtx::range("qwen_drive/language");
+            let embedded = kernels::embedding::lookup(
+                ctx,
+                &b.weights.embed_tokens,
+                &self.tokens,
+                self.token_count,
+            )?;
+            let embedded = kernels::elementwise::replace_rows_bf16(
+                ctx,
+                &embedded,
+                &self.visual_output,
+                &self.rows,
+            )?;
+            b.run_text_device(state, embedded, self.token_count, &self.cos, &self.sin)?;
+            // Language-to-planner handoff is the persistent shared KV prefix.
+            Ok(self.visual_output.clone())
+        })?;
+        execution.run(&mut || {
+            let _stage = nvtx::range("qwen_drive/planner");
+            let plan = expert::ExpertPlan {
+                scene: &self.scene,
+                scene_len: self.prompt_len,
+                anchor: self.anchor,
+                cond: &self.conditioning_shape,
+                noise: &self.noise,
+                num_steps: self.steps,
+            };
+            let flow = expert::prepare_device(&p.config, &p.weights, ctx, &plan, &self.expert)?;
+            for step in 0..self.steps {
+                p.step(&plan, &flow, step)?;
+            }
+            Ok(p.output(flow))
+        })
     }
 }

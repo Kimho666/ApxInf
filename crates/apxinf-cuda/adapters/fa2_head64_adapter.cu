@@ -11,21 +11,25 @@
 namespace FLASH_NAMESPACE {
 
 using Head64Traits = Flash_fwd_kernel_traits<64, 64, 256, 4, false, false, cutlass::bfloat16_t>;
-
-template<bool Split>
-cudaError_t launch_head64(Flash_fwd_params& params, cudaStream_t stream) {
-  auto kernel = &flash_fwd_splitkv_kernel<Head64Traits, false, false, false, false, true, false, Split, false>;
+template<typename Traits, bool Split>
+cudaError_t launch_head64_traits(Flash_fwd_params& params, cudaStream_t stream) {
+  auto kernel = &flash_fwd_splitkv_kernel<Traits, false, false, false, false, true, false, Split, false>;
   cudaStreamCaptureStatus capture;
   auto status = cudaStreamIsCapturing(stream, &capture);
   if (status != cudaSuccess) return status;
-  if (Head64Traits::kSmemSize >= 48 * 1024 && capture == cudaStreamCaptureStatusNone) {
-    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Head64Traits::kSmemSize);
+  if (Traits::kSmemSize >= 48 * 1024 && capture == cudaStreamCaptureStatusNone) {
+    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemSize);
     if (status != cudaSuccess) return status;
   }
   dim3 grid((params.seqlen_q + 63) / 64, Split ? params.num_splits : params.b,
             Split ? params.b * params.h : params.h);
-  kernel<<<grid, Head64Traits::kNThreads, Head64Traits::kSmemSize, stream>>>(params);
+  kernel<<<grid, Traits::kNThreads, Traits::kSmemSize, stream>>>(params);
   return cudaGetLastError();
+}
+
+template<bool Split>
+cudaError_t launch_head64(Flash_fwd_params& params, cudaStream_t stream) {
+  return launch_head64_traits<Head64Traits, Split>(params, stream);
 }
 
 int run_bf16_head64_splitkv(Flash_fwd_params& params, cudaStream_t stream) {

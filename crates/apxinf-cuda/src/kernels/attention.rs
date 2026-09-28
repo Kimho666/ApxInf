@@ -1,5 +1,6 @@
 //! Model-neutral attention contracts and workspace orchestration.
 
+use crate::kernels::fixed_profile::FIXED_SCENE_TOKENS;
 use apxinf_core::{DType, Device, Error, KvCache, Result, Shape, Tensor};
 
 use super::contracts::{
@@ -997,12 +998,8 @@ pub fn vision(
     #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
     if std::env::var_os("APXINF_VISION_SDPA_LEGACY").is_none() {
         let out = fa2_attention(
-            ctx, q, k, v,
-            /*batches*/ 1,
-            /*query_tokens*/ seq_len,
-            /*key_tokens*/ seq_len,
-            /*query_heads*/ n_heads,
-            /*kv_heads*/ n_heads,
+            ctx, q, k, v, /*batches*/ 1, /*query_tokens*/ seq_len,
+            /*key_tokens*/ seq_len, /*query_heads*/ n_heads, /*kv_heads*/ n_heads,
             head_dim,
         )?;
         // fa2_attention keeps the 3-D [seq, n_heads, head_dim] shape; the
@@ -1031,14 +1028,26 @@ pub fn vision(
     unsafe {
         let res = if v3_kind == 1 {
             ffi::apxinf_vision_sdpa_bf16_v3(
-                gpu_ptr(q)?, gpu_ptr(k)?, gpu_ptr(v)?, out_buf.ptr(),
-                seq_len as u32, n_heads as u32, head_dim as u32, scale,
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
                 ctx.stream().handle(),
             )
         } else if v3_kind == 2 {
             ffi::apxinf_vision_sdpa_bf16_v3_hd72(
-                gpu_ptr(q)?, gpu_ptr(k)?, gpu_ptr(v)?, out_buf.ptr(),
-                seq_len as u32, n_heads as u32, head_dim as u32, scale,
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
                 ctx.stream().handle(),
             )
         } else {
@@ -1185,6 +1194,315 @@ pub fn noncausal(
     ))
 }
 
+/// Whether the direct segmented FA2 output path covers this exact workload.
+///
+/// This intentionally stays narrower than [`noncausal`]: callers can opt in
+/// without changing the public/default attention dispatch for other models or
+/// shapes.
+pub(crate) fn segmented_noncausal_contiguous_output_bf16_shape_supported(
+    segment_lengths: &[usize],
+    n_heads: usize,
+    head_dim: usize,
+) -> bool {
+    segment_lengths == [256, 256] && n_heads == 16 && head_dim == 64
+}
+
+/// Run independent BF16 FA2 segments into disjoint rows of one contiguous
+/// output allocation. The launches share one LSE workspace because they are
+/// ordered on the same CUDA stream.
+///
+/// Returns `None` outside the exact measured shape or when the FA2 FFI is not
+/// compiled, allowing an opt-in caller to preserve its legacy path.
+pub fn segmented_noncausal_contiguous_output_bf16(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    segment_lengths: &[usize],
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    if !segmented_noncausal_contiguous_output_bf16_shape_supported(
+        segment_lengths,
+        n_heads,
+        head_dim,
+    ) {
+        return Ok(None);
+    }
+
+    let total_rows = 512usize;
+    let expected_shape = [total_rows, n_heads, head_dim];
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16 || tensor.shape().dims() != expected_shape)
+    {
+        return Err(Error::Other(format!(
+            "segmented direct BF16 FA2 expected matching {expected_shape:?} tensors"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [q, k, v] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        const SEGMENT_ROWS: usize = 256;
+        let row_bytes = checked_bytes(
+            DType::BF16,
+            &[n_heads, head_dim],
+            "segmented direct BF16 FA2 row",
+        )?;
+        let segment_bytes = SEGMENT_ROWS
+            .checked_mul(row_bytes)
+            .ok_or_else(|| Error::Other("segmented direct BF16 FA2 byte size overflow".into()))?;
+        let output = output_buffer(ctx, q.size_in_bytes())?;
+        let softmax_lse = output_buffer(
+            ctx,
+            n_heads
+                .checked_mul(SEGMENT_ROWS)
+                .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| {
+                    Error::Other("segmented direct BF16 FA2 LSE size overflow".into())
+                })?,
+        )?;
+        let q_buffer = CudaBuffer::from_tensor(q).map_err(Error::Cuda)?;
+        let k_buffer = CudaBuffer::from_tensor(k).map_err(Error::Cuda)?;
+        let v_buffer = CudaBuffer::from_tensor(v).map_err(Error::Cuda)?;
+
+        for segment_index in 0..2 {
+            let byte_offset = segment_index * segment_bytes;
+            let q_segment = q_buffer
+                .view(byte_offset, segment_bytes)
+                .map_err(Error::Cuda)?;
+            let k_segment = k_buffer
+                .view(byte_offset, segment_bytes)
+                .map_err(Error::Cuda)?;
+            let v_segment = v_buffer
+                .view(byte_offset, segment_bytes)
+                .map_err(Error::Cuda)?;
+            let output_segment = output
+                .view(byte_offset, segment_bytes)
+                .map_err(Error::Cuda)?;
+            unsafe {
+                ffi::check_cuda(ffi::apxinf_static_fa2_bf16(
+                    q_segment.ptr(),
+                    k_segment.ptr(),
+                    v_segment.ptr(),
+                    output_segment.ptr(),
+                    softmax_lse.ptr(),
+                    1,
+                    SEGMENT_ROWS as i32,
+                    SEGMENT_ROWS as i32,
+                    n_heads as i32,
+                    n_heads as i32,
+                    head_dim as i32,
+                    (head_dim as f32).sqrt().recip(),
+                    ctx.stream().handle(),
+                ))
+                .map_err(Error::Cuda)?;
+            }
+        }
+
+        return Ok(Some(make_gpu_tensor(
+            Shape::new(vec![total_rows, n_heads * head_dim]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )));
+    }
+
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Ok(None)
+}
+
+/// Supported envelope of the explicit SM87/SM110 non-causal BF16 BM64 kernel:
+/// 41 queries, 28/41/128 keys, 32 heads and head dimension 48.
+/// Callers select this specialization; the default FA2 dispatch is unchanged.
+pub(crate) const fn noncausal_hdim96_bm64_shape_supported(
+    compute_major: u32,
+    compute_minor: u32,
+    query_tokens: usize,
+    key_tokens: usize,
+    heads: usize,
+    head_dim: usize,
+) -> bool {
+    ((compute_major == 8 && compute_minor == 7) || (compute_major == 11 && compute_minor == 0))
+        && query_tokens == 41
+        && matches!(key_tokens, 28 | 41 | 128)
+        && heads == 32
+        && head_dim == 48
+}
+
+pub fn noncausal_hdim96_bm64(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    let supported_shape = k_dims.first().is_some_and(|&key_tokens| {
+        noncausal_hdim96_bm64_shape_supported(
+            ctx.caps().compute_major,
+            ctx.caps().compute_minor,
+            q_dims.first().copied().unwrap_or(0),
+            key_tokens,
+            n_heads,
+            head_dim,
+        )
+    });
+    if q_dims != [41, 32, 48]
+        || k_dims.len() != 3
+        || k_dims[1..] != [32, 48]
+        || v.shape() != k.shape()
+        || !supported_shape
+    {
+        return Ok(None);
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16 || tensor.device() != expected_device)
+    {
+        return Ok(None);
+    }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let output = output_buffer(ctx, q.size_in_bytes())?;
+        let softmax_lse = output_buffer(ctx, 32 * 41 * std::mem::size_of::<f32>())?;
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_static_fa2_bf16_hdim96_bm64(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                output.ptr(),
+                softmax_lse.ptr(),
+                1,
+                41,
+                k_dims[0] as i32,
+                32,
+                32,
+                48,
+                (48.0f32).sqrt().recip(),
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        return Ok(Some(make_gpu_tensor(
+            Shape::new(vec![41, 32 * 48]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )));
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Ok(None)
+}
+
+/// Try multiple equal-length, contiguous non-causal attention segments.
+///
+/// Returns `None` when FA2 was not compiled so callers can use their existing
+/// per-segment path. Operand validation and execution errors from an available
+/// provider are propagated.
+#[allow(clippy::too_many_arguments)]
+pub fn try_noncausal_batched_equal(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batches: usize,
+    sequence_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    if !cfg!(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)) {
+        return Ok(None);
+    }
+    noncausal_batched_equal(ctx, q, k, v, batches, sequence_len, n_heads, head_dim).map(Some)
+}
+
+/// Explicit batched attention for multiple equal-length, contiguous segments.
+/// Each segment remains an independent FA2 batch; the public single-segment
+/// operator and its default dispatch are unchanged.
+pub fn noncausal_batched_equal(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batches: usize,
+    sequence_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if batches < 2 || sequence_len == 0 {
+        return Err(Error::Other(
+            "batched noncausal attention requires at least two non-empty segments".into(),
+        ));
+    }
+    let total_rows = batches
+        .checked_mul(sequence_len)
+        .ok_or_else(|| Error::Other("batched noncausal row count overflow".into()))?;
+    let shape = [total_rows, n_heads, head_dim];
+    if q.dtype() != DType::BF16
+        || k.dtype() != DType::BF16
+        || v.dtype() != DType::BF16
+        || q.shape().dims() != shape
+        || k.shape().dims() != shape
+        || v.shape().dims() != shape
+        || n_heads == 0
+        || head_dim == 0
+        || head_dim > 64
+        || head_dim % 2 != 0
+    {
+        return Err(Error::Other(format!(
+            "batched noncausal attention expected BF16 {shape:?}, got {} {:?}, {} {:?}, {} {:?}",
+            q.dtype(),
+            q.shape().dims(),
+            k.dtype(),
+            k.shape().dims(),
+            v.dtype(),
+            v.shape().dims()
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [q, k, v] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let output = fa2_attention(
+            ctx,
+            q,
+            k,
+            v,
+            batches,
+            sequence_len,
+            sequence_len,
+            n_heads,
+            n_heads,
+            head_dim,
+        )?;
+        return output.reshape(vec![total_rows, n_heads * head_dim]);
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Err(Error::Other(
+        "batched noncausal attention requires the FA2 provider".into(),
+    ))
+}
+
 pub fn noncausal_strided_qkv(
     ctx: &CudaContext,
     qkv: &Tensor,
@@ -1259,6 +1577,58 @@ pub fn noncausal_strided_qkv(
     Err(Error::Other(
         "strided QKV attention requires the in-tree BF16 FA2 backend".into(),
     ))
+}
+
+/// Strided-QKV companion to [`noncausal_hdim96_bm64`]. The ordinary strided
+/// FA2 entry remains the fallback for every other device or shape.
+pub fn noncausal_strided_qkv_hdim96_bm64(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    if !noncausal_hdim96_bm64_shape_supported(
+        ctx.caps().compute_major,
+        ctx.caps().compute_minor,
+        qkv.shape().dims().first().copied().unwrap_or(0),
+        qkv.shape().dims().first().copied().unwrap_or(0),
+        n_heads,
+        head_dim,
+    ) || qkv.dtype() != DType::BF16
+        || qkv.shape().dims() != [41, 3 * 32 * 48]
+        || qkv.device() != Device::Cuda(ctx.device_id())
+        || n_heads != 32
+        || head_dim != 48
+    {
+        return Ok(None);
+    }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let output = output_buffer(ctx, 41 * 32 * 48 * DType::BF16.size_in_bytes())?;
+        let softmax_lse = output_buffer(ctx, 32 * 41 * std::mem::size_of::<f32>())?;
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_static_fa2_bf16_strided_qkv_hdim96_bm64(
+                gpu_ptr(qkv)?,
+                output.ptr(),
+                softmax_lse.ptr(),
+                1,
+                41,
+                32,
+                48,
+                (48.0f32).sqrt().recip(),
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        return Ok(Some(make_gpu_tensor(
+            Shape::new(vec![41, 32 * 48]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )));
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Ok(None)
 }
 
 /// Causal attention mask on CUDA. Dispatches on dtype.
@@ -2208,7 +2578,9 @@ pub fn causal_gqa_bf16(
                 && q_shape[0] > 1
                 && std::env::var_os("APXINF_ATTN_COMPOSED_PREFILL").is_none()
             {
-                return fa2_attention_causal(ctx,q,k,v,q_shape[0],key_tokens,q_shape[1],k_shape[1],q_shape[2]);
+                return fa2_attention_causal(
+                    ctx, q, k, v, q_shape[0], key_tokens, q_shape[1], k_shape[1], q_shape[2],
+                );
             }
             // Single-token decode. `APXINF_ATTN_COMPOSED_DECODE` routes it
             // back through the composed path, which is what this branch did
@@ -2218,7 +2590,9 @@ pub fn causal_gqa_bf16(
             // already does for prefill.
             #[cfg(apxinf_fa2_head_special)]
             if q_shape[0] == 1 && std::env::var_os("APXINF_ATTN_COMPOSED_DECODE").is_none() {
-                return fa2_attention_splitkv(ctx,q,k,v,1,1,key_tokens,q_shape[1],k_shape[1],q_shape[2],false);
+                return fa2_attention_splitkv(
+                    ctx, q, k, v, 1, 1, key_tokens, q_shape[1], k_shape[1], q_shape[2], false,
+                );
             }
             return composed_gqa_bf16(ctx, q, k, v, key_tokens, true);
         }
@@ -2379,6 +2753,439 @@ pub(crate) fn vision_fa2_enabled() -> bool {
     )
 }
 
+#[cfg(apxinf_aot_sm110)]
+fn check_fa4_d256_status(status: i32) -> Result<()> {
+    if status >= 0x10000 {
+        return Err(Error::Other(format!(
+            "FA4 D256 AOT wrapper failed with status 0x{status:x}"
+        )));
+    }
+    check_cuda(status)
+}
+
+/// Split action attention over 3438 physical KV rows. Immutable masks admit
+/// the real prompt prefix plus 50 action tokens, preserving the 1718-row split.
+pub fn try_gqa_bf16_fa4_d256_splitbatch_sm110(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    key_tokens: usize,
+) -> Result<Option<Tensor>> {
+    #[cfg(apxinf_aot_sm110)]
+    {
+        // Mirrors the C ABI header. This status is emitted only before any
+        // kernel launch, so the existing D256 attention path can run safely.
+        const UNSUPPORTED_TOPOLOGY: i32 = 0x20000;
+        let q_shape = q.shape().dims();
+        let kv_shape = k.shape().dims();
+        if ctx.caps().sm != 110
+            || q_shape != [50, 16, 256]
+            || kv_shape != [3438, 4, 256]
+            || v.shape() != k.shape()
+            || [q, k, v].into_iter().any(|t| t.dtype() != DType::BF16)
+            || !(3433..=3437).contains(&key_tokens)
+        {
+            return Ok(None);
+        }
+        let q_bytes = checked_bytes(DType::BF16, q_shape, "FA4 split A Q")?;
+        let kv_bytes = checked_bytes(DType::BF16, kv_shape, "FA4 split A KV")?;
+        let q_buf = CudaBuffer::from_tensor(q).map_err(Error::Cuda)?;
+        let k_buf = CudaBuffer::from_tensor(k).map_err(Error::Cuda)?;
+        let v_buf = CudaBuffer::from_tensor(v).map_err(Error::Cuda)?;
+        require_buffers(
+            ctx,
+            "FA4 split A",
+            &[
+                ("q", &q_buf, q_bytes),
+                ("k", &k_buf, kv_bytes),
+                ("v", &v_buf, kv_bytes),
+            ],
+        )?;
+        if ((q_buf.ptr() as usize) | (k_buf.ptr() as usize) | (v_buf.ptr() as usize)) & 15 != 0 {
+            return Ok(None);
+        }
+        unsafe {
+            let status = if crate::workspace::may_prepare_native_resources() {
+                ffi::apxinf_static_fa4_split_batch_init(ctx.stream().handle())
+            } else {
+                ffi::apxinf_static_fa4_split_batch_ready()
+            };
+            if status == UNSUPPORTED_TOPOLOGY {
+                return Ok(None);
+            }
+            check_fa4_d256_status(status)?;
+        }
+        let q2 = output_buffer(ctx, q_bytes * 2)?;
+        let partial = output_buffer(ctx, q_bytes * 2)?;
+        let lse = output_buffer(ctx, 2 * 16 * 50 * std::mem::size_of::<f32>())?;
+        let output = output_buffer(ctx, q_bytes)?;
+        if ((q2.ptr() as usize)
+            | (partial.ptr() as usize)
+            | (lse.ptr() as usize)
+            | (output.ptr() as usize))
+            & 15
+            != 0
+        {
+            return Ok(None);
+        }
+        unsafe {
+            let status = ffi::apxinf_static_fa4_split_batch_forward(
+                q_buf.ptr(),
+                k_buf.ptr(),
+                v_buf.ptr(),
+                q2.ptr(),
+                partial.ptr(),
+                lse.ptr().cast::<f32>(),
+                output.ptr(),
+                key_tokens as i32,
+                ctx.stream().handle(),
+            );
+            if status == UNSUPPORTED_TOPOLOGY {
+                return Ok(None);
+            }
+            check_fa4_d256_status(status)?;
+        }
+        Ok(Some(make_gpu_tensor(
+            q.shape().clone(),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )))
+    }
+    #[cfg(not(apxinf_aot_sm110))]
+    {
+        let _ = (ctx, q, k, v, key_tokens);
+        Ok(None)
+    }
+}
+
+/// Causal BF16 language attention for the fixed SM110 prompt geometry.
+/// Unsupported shapes use the generic BF16 implementation.
+pub fn try_gqa_bf16_fa4_d256_sm110(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    key_tokens: usize,
+) -> Result<Option<Tensor>> {
+    #[cfg(apxinf_aot_sm110)]
+    {
+        let (query_tokens, kv_tokens) = (FIXED_SCENE_TOKENS, FIXED_SCENE_TOKENS);
+        let q_shape = q.shape().dims();
+        let k_shape = k.shape().dims();
+        if ctx.caps().sm != 110
+            || q_shape != [query_tokens, 16, 256]
+            || k_shape != [kv_tokens, 4, 256]
+            || v.shape() != k.shape()
+            || [q, k, v].into_iter().any(|t| t.dtype() != DType::BF16)
+            || key_tokens != kv_tokens
+        {
+            return Ok(None);
+        }
+        let q_bytes = checked_bytes(DType::BF16, q_shape, "FA4 D256 Q")?;
+        let kv_bytes = checked_bytes(DType::BF16, k_shape, "FA4 D256 KV")?;
+        let q_buf = CudaBuffer::from_tensor(q).map_err(Error::Cuda)?;
+        let k_buf = CudaBuffer::from_tensor(k).map_err(Error::Cuda)?;
+        let v_buf = CudaBuffer::from_tensor(v).map_err(Error::Cuda)?;
+        require_buffers(
+            ctx,
+            "FA4 D256",
+            &[
+                ("q", &q_buf, q_bytes),
+                ("k", &k_buf, kv_bytes),
+                ("v", &v_buf, kv_bytes),
+            ],
+        )?;
+        if crate::workspace::may_prepare_native_resources() {
+            unsafe {
+                check_fa4_d256_status(ffi::apxinf_static_fa4_d256_init())?;
+            }
+        }
+        let output = output_buffer(ctx, q_bytes)?;
+        unsafe {
+            check_fa4_d256_status(ffi::apxinf_static_fa4_d256_forward(
+                q_buf.ptr(),
+                k_buf.ptr(),
+                v_buf.ptr(),
+                output.ptr(),
+                ctx.stream().handle(),
+            ))?;
+        }
+        Ok(Some(make_gpu_tensor(
+            q.shape().clone(),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )))
+    }
+    #[cfg(not(apxinf_aot_sm110))]
+    {
+        let _ = (ctx, q, k, v, key_tokens);
+        Ok(None)
+    }
+}
+
+#[cfg(apxinf_aot_sm110)]
+fn check_fa4_vision_status(status: i32) -> Result<()> {
+    if status >= 0x10000 {
+        return Err(Error::Other(format!(
+            "FA4 vision AOT wrapper failed with status 0x{status:x}"
+        )));
+    }
+    check_cuda(status)
+}
+
+const FA4_VFIXED_OFFSETS: [u32; 13] = [
+    0, 624, 1248, 1872, 4072, 4696, 5320, 5944, 8144, 8768, 9392, 10016, 12216,
+];
+
+/// Prepare fixed-group FA4 before Graph capture. Only an explicit unsupported
+/// device/module state selects the already initialized varlen fallback.
+fn prepare_bf16_fa4_fixed_groups_sm110(ctx: &CudaContext, host_offsets: &[u32]) -> Result<bool> {
+    #[cfg(apxinf_aot_sm110)]
+    {
+        if ctx.caps().sm != 110
+            || ctx.caps().multiprocessor_count != 20
+            || host_offsets != FA4_VFIXED_OFFSETS.as_slice()
+        {
+            return Ok(false);
+        }
+        if crate::workspace::may_prepare_native_resources() {
+            // Keep accepted varlen ready for explicitly unsupported fixed-AOT
+            // initialization. All other initialization errors propagate.
+            let status = unsafe { ffi::apxinf_static_fa4_bf16_vfixed_init(ctx.stream().handle()) };
+            if status == 0x20000 {
+                return Ok(false);
+            }
+            check_fa4_vision_status(status)?;
+            return Ok(true);
+        }
+        let status = unsafe { ffi::apxinf_static_fa4_bf16_vfixed_ready() };
+        if status == 0x20000 {
+            return Ok(false);
+        }
+        check_fa4_vision_status(status)?;
+        Ok(true)
+    }
+    #[cfg(not(apxinf_aot_sm110))]
+    {
+        let _ = (ctx, host_offsets);
+        Ok(false)
+    }
+}
+
+/// One model-neutral BF16 attention operation over four fixed groups and a
+/// physical V token stride of 3072 elements. `false` means no launch occurred.
+#[allow(clippy::too_many_arguments)]
+fn try_bf16_fa4_fixed_groups_sm110(
+    ctx: &CudaContext,
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    output: &CudaBuffer,
+    dtype: DType,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    v_token_stride: usize,
+    host_offsets: &[u32],
+) -> Result<bool> {
+    #[cfg(apxinf_aot_sm110)]
+    {
+        if ctx.caps().sm != 110
+            || ctx.caps().multiprocessor_count != 20
+            || dtype != DType::BF16
+            || tokens != 12216
+            || heads != 16
+            || head_dim != 64
+            || v_token_stride != 3072
+            || host_offsets != FA4_VFIXED_OFFSETS.as_slice()
+        {
+            return Ok(false);
+        }
+        let plane_bytes = checked_bytes(dtype, &[tokens, heads, head_dim], "FA4 fixed plane")?;
+        let v_words = (tokens - 1)
+            .checked_mul(v_token_stride)
+            .and_then(|words| words.checked_add(heads * head_dim))
+            .ok_or_else(|| Error::Other("FA4 fixed V extent overflow".into()))?;
+        let v_bytes = v_words
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| Error::Other("FA4 fixed V byte extent overflow".into()))?;
+        require_buffers(
+            ctx,
+            "FA4 fixed groups",
+            &[
+                ("q", q, plane_bytes),
+                ("k", k, plane_bytes),
+                ("v", v, v_bytes),
+                ("output", output, plane_bytes),
+            ],
+        )?;
+        if [q.ptr(), k.ptr(), v.ptr(), output.ptr()]
+            .iter()
+            .any(|ptr| (*ptr as usize) & 15 != 0)
+        {
+            return Ok(false);
+        }
+        check_fa4_vision_status(unsafe {
+            ffi::apxinf_static_fa4_bf16_vfixed_forward(
+                q.ptr(),
+                k.ptr(),
+                v.ptr(),
+                output.ptr(),
+                ctx.stream().handle(),
+            )
+        })?;
+        Ok(true)
+    }
+    #[cfg(not(apxinf_aot_sm110))]
+    {
+        let _ = (
+            ctx,
+            q,
+            k,
+            v,
+            output,
+            dtype,
+            tokens,
+            heads,
+            head_dim,
+            v_token_stride,
+            host_offsets,
+        );
+        Ok(false)
+    }
+}
+
+/// Optional physical path for an already-biased interleaved BF16 vision QKV
+/// projection. RoPE writes only contiguous Q/K; FA4 reads V directly from
+/// the retained QKV allocation with token stride `3 * heads * head_dim`.
+/// Unsupported geometry returns `None` before allocating or launching.
+#[allow(clippy::too_many_arguments)]
+pub fn try_vision_qkv_rope_segmented_fa4_skip_v(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    position_ids: &CudaBuffer,
+    heads: usize,
+    head_dim: usize,
+    theta: f32,
+    offsets: &CudaBuffer,
+    host_offsets: &[u32],
+    segments: usize,
+    fixed_groups: bool,
+) -> Result<Option<Tensor>> {
+    #[cfg(apxinf_aot_sm110)]
+    {
+        let (tokens, width) = matrix_shape(qkv, "vision QKV RoPE FA4 skip V")?;
+        if ctx.caps().sm != 110
+            || qkv.dtype() != DType::BF16
+            || tokens != 12216
+            || heads != 16
+            || head_dim != 64
+            || width != 3 * heads * head_dim
+            || segments != 12
+            || host_offsets.len() != 13
+        {
+            return Ok(None);
+        }
+        require_finite("vision QKV RoPE FA4 skip V", &[theta])?;
+        if theta <= 0.0 {
+            return Err(Error::Other(
+                "vision QKV RoPE theta must be positive".into(),
+            ));
+        }
+        if host_offsets.first() != Some(&0)
+            || host_offsets.last() != Some(&12216)
+            || host_offsets.windows(2).any(|pair| pair[1] <= pair[0])
+        {
+            return Err(Error::Other("FA4 vision offsets are invalid".into()));
+        }
+        if host_offsets.windows(2).any(|pair| pair[1] - pair[0] > 2200) {
+            return Ok(None);
+        }
+        let qkv_bytes = checked_bytes(DType::BF16, qkv.shape().dims(), "FA4 vision raw QKV")?;
+        let plane_bytes =
+            checked_bytes(DType::BF16, &[tokens, heads, head_dim], "FA4 vision plane")?;
+        let position_bytes = tokens
+            .checked_mul(2 * std::mem::size_of::<u32>())
+            .ok_or_else(|| Error::Other("FA4 vision position size overflow".into()))?;
+        let qkv_buf = CudaBuffer::from_tensor(qkv).map_err(Error::Cuda)?;
+        require_buffers(
+            ctx,
+            "FA4 vision skip V",
+            &[
+                ("qkv", &qkv_buf, qkv_bytes),
+                ("positions", position_ids, position_bytes),
+                ("offsets", offsets, 13 * std::mem::size_of::<i32>()),
+            ],
+        )?;
+        let v_offset = 2 * heads * head_dim * DType::BF16.size_in_bytes();
+        let v_view = qkv_buf
+            .view(v_offset, qkv_bytes - v_offset)
+            .map_err(Error::Cuda)?;
+        if !fixed_groups || !prepare_bf16_fa4_fixed_groups_sm110(ctx, host_offsets)? {
+            return Ok(None);
+        }
+        let q = output_buffer(ctx, plane_bytes)?;
+        let k = output_buffer(ctx, plane_bytes)?;
+        let output = output_buffer(ctx, plane_bytes)?;
+        check_cuda(unsafe {
+            ffi::apxinf_static_vision_qk_rope_bf16_no_v(
+                qkv_buf.ptr(),
+                position_ids.ptr().cast(),
+                q.ptr(),
+                k.ptr(),
+                tokens as i32,
+                heads as i32,
+                head_dim as i32,
+                theta,
+                ctx.stream().handle(),
+            )
+        })?;
+        let fixed_launched = try_bf16_fa4_fixed_groups_sm110(
+            ctx,
+            &q,
+            &k,
+            &v_view,
+            &output,
+            DType::BF16,
+            tokens,
+            heads,
+            head_dim,
+            3 * heads * head_dim,
+            host_offsets,
+        )?;
+        if !fixed_launched {
+            return Err(Error::Other(
+                "prepared fixed attention rejected its bindings".into(),
+            ));
+        }
+        Ok(Some(make_gpu_tensor(
+            Shape::new(vec![tokens, heads, head_dim]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )))
+    }
+    #[cfg(not(apxinf_aot_sm110))]
+    {
+        let _ = (
+            ctx,
+            qkv,
+            position_ids,
+            heads,
+            head_dim,
+            theta,
+            offsets,
+            host_offsets,
+            segments,
+            fixed_groups,
+        );
+        Ok(None)
+    }
+}
+
 pub fn segmented_mha_bf16(
     ctx: &CudaContext,
     q: &Tensor,
@@ -2430,14 +3237,14 @@ pub fn segmented_mha_bf16(
         // stay fp32 end-to-end and P is rounded to bf16 for the PV MMA exactly as FA2 does.
         // Revert/replace in the acceptance-bound revision per the prevailing marker policy.
         let orig_head_dim = shape[2]; // FIX (implement_r6)
-        // The head-64 specialisation, not the sm_80 family. `run_bf16_head64_splitkv`
-        // is compiled wherever `fa2_head_special` is on, and the composed arm
-        // below exists because the vendored FA2 forward family was measured
-        // pathological on sm_89 -- which is a statement about sm_89, not about
-        // every device outside the sm_80 family. On Thor the composed arm is
-        // 628.6 ms of the 4.435 s scene: 369.8 ms of cutlass_80_simt_sgemm and
-        // 258.8 ms of row_softmax_f32_bf16, all of it fp32 on CUDA cores, the
-        // one unit where Thor is only 1.59x Orin.
+                                      // The head-64 specialisation, not the sm_80 family. `run_bf16_head64_splitkv`
+                                      // is compiled wherever `fa2_head_special` is on, and the composed arm
+                                      // below exists because the vendored FA2 forward family was measured
+                                      // pathological on sm_89 -- which is a statement about sm_89, not about
+                                      // every device outside the sm_80 family. On Thor the composed arm is
+                                      // 628.6 ms of the 4.435 s scene: 369.8 ms of cutlass_80_simt_sgemm and
+                                      // 258.8 ms of row_softmax_f32_bf16, all of it fp32 on CUDA cores, the
+                                      // one unit where Thor is only 1.59x Orin.
         #[cfg(apxinf_fa2_head_special)]
         if orig_head_dim == 64 && vision_fa2_enabled() {
             if host_offsets.first() != Some(&0)
@@ -2505,13 +3312,19 @@ pub fn segmented_mha_bf16(
             let scores_dtype = if widen { DType::F32 } else { DType::BF16 };
             let elem = if widen { 4 } else { 2 };
             let (q_buf, k_buf) = if widen {
-                let qf32 = CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                let qf32 =
+                    CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                        .map_err(Error::Cuda)?;
+                let qt = qf32
+                    .as_tensor(q.shape().clone(), DType::F32)
                     .map_err(Error::Cuda)?;
-                let qt = qf32.as_tensor(q.shape().clone(), DType::F32).map_err(Error::Cuda)?;
                 super::linear_attention::cast_bf16_to_f32(ctx, q, &qt)?;
-                let kf32 = CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                let kf32 =
+                    CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                        .map_err(Error::Cuda)?;
+                let kt = kf32
+                    .as_tensor(k.shape().clone(), DType::F32)
                     .map_err(Error::Cuda)?;
-                let kt = kf32.as_tensor(k.shape().clone(), DType::F32).map_err(Error::Cuda)?;
                 super::linear_attention::cast_bf16_to_f32(ctx, k, &kt)?;
                 (qf32, kf32)
             } else {
@@ -2565,7 +3378,7 @@ pub fn segmented_mha_bf16(
                     )?;
                     let scores_head =
                         buffer_slice(&scores, head * tokens * tokens * 4, tokens * tokens * 4)?; // FIX (implement_r8)
-                    // Q*K^T; alpha folds the softmax scale bound to the true dim 64.
+                                                                                                 // Q*K^T; alpha folds the softmax scale bound to the true dim 64.
                     let cublas = ctx.cublas();
                     let call = if scores_dtype == DType::F32 {
                         cublas.gemm_ex(
@@ -3212,4 +4025,38 @@ pub fn mqa_f16_e4m3_522(
     Err(Error::Other(
         "FA2 direct E4M3 requires an SM100-family FA2 build".into(),
     ))
+}
+
+#[cfg(test)]
+mod segmented_output_tests {
+    use super::segmented_noncausal_contiguous_output_bf16_shape_supported;
+
+    #[test]
+    fn direct_segmented_bf16_output_gate_is_exact() {
+        assert!(segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[128, 128],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            8,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            16,
+            128
+        ));
+    }
 }

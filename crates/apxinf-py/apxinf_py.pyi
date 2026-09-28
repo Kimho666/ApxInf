@@ -26,7 +26,11 @@ class SentencePieceTokenizer:
     def from_file(path: str) -> "SentencePieceTokenizer": ...
     def encode(self, text: str, add_bos: bool = ...) -> list[int]: ...
 
-class Model:
+class _PackedRgbU8:
+    """Owned contiguous RGB storage consumed by one inference call."""
+    ...
+
+class ModelRunner:
     """A loaded VLA model handle exposing its bare-model inference contract."""
 
     @staticmethod
@@ -45,7 +49,7 @@ class Model:
         flow_start_time: float | None = ...,
         sampling_seed: int = ...,
         assets: dict[str, str] | None = ...,
-    ) -> "Model":
+    ) -> "ModelRunner":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
         ``device`` is ``cuda:N`` (default) or ``cpu``.
@@ -80,6 +84,45 @@ class Model:
     ) -> npt.NDArray[np.float32]:
         """Private L0 path for processor-produced typed VLA inputs."""
         ...
+
+    @staticmethod
+    def _pack_rgb_u8_frames(frames: list[npt.NDArray[np.uint8]]) -> _PackedRgbU8: ...
+
+    def _infer_resized_rgb(
+        self,
+        rgb_u8: npt.NDArray[np.uint8],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int | None,
+        noise: npt.NDArray[np.float32],
+        *,
+        num_steps: int | None = None,
+        max_new_tokens: int | None = None,
+        min_new_tokens: int = 0,
+        terminator_ids: list[int] | None = None,
+        closing_ids: list[int] | None = None,
+        raw_resize_frames: npt.NDArray[np.uint32] | None = None,
+    ) -> npt.NDArray[np.float32]: ...
+
+    def _infer_resized_rgb_packed(
+        self,
+        packed: _PackedRgbU8,
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int | None,
+        noise: npt.NDArray[np.float32],
+        *,
+        num_steps: int | None = None,
+        max_new_tokens: int | None = None,
+        min_new_tokens: int = 0,
+        terminator_ids: list[int] | None = None,
+        closing_ids: list[int] | None = None,
+        raw_resize_frames: npt.NDArray[np.uint32] | None = None,
+    ) -> npt.NDArray[np.float32]: ...
 
     def _calibrate_preprocessed(
         self,
@@ -151,3 +194,6 @@ class Model:
     def max_token_len(self) -> int: ...
     @property
     def accepts_rgb_u8(self) -> bool: ...
+
+# Exported by CUDA builds; shared fixed-profile geometry.
+QWEN_DRIVE_FIXED_SCENE_TOKENS: int

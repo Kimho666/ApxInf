@@ -128,6 +128,47 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 | Jetson AGX Orin | BF16 | 117.3 ms | 25.34 ms |
 | RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
 
+### GR00T N1.7
+
+One or two views, batch 1. Best recorded P50.
+
+| Hardware | Precision | 1-view P50 | 2-view P50 |
+|---|---|---:|---:|
+| Jetson AGX Thor | BF16 | 51.834 ms | 54.216 ms |
+| Jetson AGX Thor | FP8 | 32.557 ms | 35.436 ms |
+| Jetson AGX Orin | BF16 | 75.778 ms | 84.864 ms |
+| Jetson AGX Orin | W8A8 | 56.711 ms | 64.924 ms |
+
+[Details](doc/gr00t-n1.7.md).
+
+### Qwen3.8-27B-NVFP4
+
+Text LLM, 48 Gated DeltaNet + 16 full-attention layers, mixed NVFP4/FP8.
+2048-token prompt, 128 greedy tokens, batch 1, BF16 KV cache; steady state
+after one warm-up generation. See [doc/qwen38-nvfp4.md](doc/qwen38-nvfp4.md)
+for CLI inference.
+
+| Hardware | Precision | TTFT (2048) | Decode | Throughput |
+|---|---|---:|---:|---:|
+| Jetson AGX Thor | NVFP4/FP8 | 534 ms | 78.1 ms/token | 12.8 tok/s |
+
+```bash
+cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
+    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3
+```
+
+
+### Qwen-Drive
+
+Direct planning, BF16, batch 1, 10 flow steps and 12 input frames. Latency covers
+the end-to-end request from resident decoded images to the host trajectory.
+
+| Hardware | Precision | Latency | Throughput | PDM |
+|---|---|---:|---:|---:|
+| Jetson AGX Thor SM110 | BF16 | 482.60 ms | 2.07 Hz | 85.6786 |
+
+[Test setup, reproduction steps and accuracy results](doc/qwen-drive-benchmark.md).
+
 
 ## Port a new model with an agent
 

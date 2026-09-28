@@ -1,7 +1,6 @@
 //! Planning computation: multimodal prefix, optional reasoning, then flow sampling.
 //! The caller owns backbone state and chooses how GDN blocks execute.
 use super::blocks::bf16::{expert, upload_u32, BackboneBf16, BackboneState, PlannerBf16};
-use super::blocks::GdnExecution;
 use super::{PlanningState, VisionState};
 use crate::qwen_drive::backend::kernels::linear_attention;
 use crate::qwen_drive::inputs::ExpertConditioning;
@@ -18,6 +17,12 @@ pub(crate) struct ReasoningInput<'a> {
 }
 pub(crate) struct PlanningInput<'a> {
     pub token_ids: &'a [u32],
+    /// Unmasked tokens in `token_ids`. Equal to `token_ids.len()` for an unpadded
+    /// prompt, smaller when the caller padded to a fixed width to keep the
+    /// shape-specialised kernels reachable. Everything semantic — the expert's
+    /// scene extent, the planner KV offset, the attention key count — uses this;
+    /// buffer shapes use `token_ids.len()`.
+    pub prompt_len: usize,
     pub pixels: &'a Tensor,
     pub grids: &'a [[u32; 3]],
     pub conditioning: &'a ExpertConditioning,
@@ -58,15 +63,49 @@ impl QwenDriveModel {
     pub fn new_state(&self, vision: std::rc::Rc<VisionState>) -> Result<PlanningState> {
         self.backbone.new_state(vision)
     }
+    pub fn reset_state(&self, state: &mut PlanningState) -> Result<()> {
+        self.backbone.reset_state(state)
+    }
 
-    pub fn infer(
+    pub(crate) fn validate_layout(&self, token_ids: &[u32], grids: &[[u32; 3]]) -> Result<()> {
+        self.backbone.rope_index(token_ids, grids).map(|_| ())
+    }
+    pub(crate) fn prepare_direct_inputs(
         &self,
-        state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
-        input: &PlanningInput<'_>,
+        state: &mut PlanningState,
+        vision: &VisionState,
+        token_ids: &[u32],
+        prompt_len: usize,
+        pixels: &Tensor,
+        grids: &[[u32; 3]],
+        cond: ExpertConditioning,
+        steps: usize,
+    ) -> Result<super::DirectInputs> {
+        super::DirectInputs::new(
+            &self.backbone,
+            &self.planner,
+            state,
+            vision,
+            token_ids,
+            prompt_len,
+            pixels,
+            grids,
+            cond,
+            steps,
+        )
+    }
+    pub(crate) fn forward_direct(
+        &self,
+        inputs: &super::DirectInputs,
+        state: &mut PlanningState,
+        execution: &mut dyn super::DirectExecution,
     ) -> Result<Tensor> {
+        inputs.forward(&self.backbone, &self.planner, state, execution)
+    }
+
+    pub fn infer(&self, state: &mut BackboneState, input: &PlanningInput<'_>) -> Result<Tensor> {
         let b = &self.backbone;
-        let hidden = b.prefill(state, execution, input.token_ids, input.pixels, input.grids)?;
+        let hidden = b.prefill(state, input.token_ids, input.pixels, input.grids)?;
         let anchor = if let Some(reasoning) = &input.reasoning {
             let mut generated = Vec::new();
             let mut sampler = b.cuda.create_token_sampler(TokenSamplingSpec {
@@ -82,7 +121,6 @@ impl QwenDriveModel {
             let prompt_anchor = state.last_position;
             let eos = upload_u32(b.ctx(), reasoning.terminator_ids)?;
             for step in 0..reasoning.max_new_tokens {
-                state.decode_step = Some(step);
                 if step < reasoning.min_new_tokens {
                     linear_attention::suppress_logits(
                         b.ctx(),
@@ -99,7 +137,7 @@ impl QwenDriveModel {
                 {
                     break;
                 }
-                let hidden = b.forward_tokens(state, execution, &[sample.token_id])?;
+                let hidden = b.forward_tokens(state, &[sample.token_id])?;
                 logits = b.next_logits(&hidden)?;
             }
             let mut closed = generated.clone();
@@ -112,17 +150,22 @@ impl QwenDriveModel {
             closed.extend_from_slice(reasoning.closing_ids);
             let cached = generated.len().saturating_sub(1);
             if cached < closed.len() {
-                b.forward_tokens(state, execution, &closed[cached..])?;
+                b.forward_tokens(state, &closed[cached..])?;
             }
             prompt_anchor + closed.len() as i64
         } else {
-            state.last_position
+            let positions = b.rope_index(input.token_ids, input.grids)?;
+            *positions[input.prompt_len - 1].iter().max().unwrap() as i64
         };
         // Direct planning and turn completion need caches, not language logits.
         let scene = b.scene_caches(state)?;
         let expert_input = expert::ExpertPlan {
             scene: &scene,
-            scene_len: state.cache_len,
+            scene_len: if input.reasoning.is_some() {
+                state.cache_len
+            } else {
+                input.prompt_len
+            },
             anchor,
             cond: input.conditioning,
             noise: input.noise,
