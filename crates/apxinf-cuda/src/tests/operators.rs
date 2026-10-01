@@ -8,7 +8,9 @@ use crate::kernels::cache::append;
 use crate::kernels::elementwise::{add, add_bias, concat_columns_bf16, mul, scale};
 use crate::kernels::embedding::lookup;
 use crate::kernels::norm::{layer, rms};
-use crate::kernels::rope::{apply, apply_batched, apply_mrope, apply_vision_2d};
+use crate::kernels::rope::{
+    apply, apply_batched, apply_half_split_f16, apply_mrope, apply_vision_2d,
+};
 
 fn gpu_ptr(tensor: &Tensor) -> Result<*mut std::ffi::c_void> {
     Ok(CudaBuffer::from_tensor(tensor).map_err(Error::Cuda)?.ptr())
@@ -474,6 +476,74 @@ fn rope_batched_bf16_matches_fp32_reference() {
     let t_in = upload_fp32_as_bf16(&ctx, &input, vec![seq_len, n_heads, head_dim]).unwrap();
     let out = apply_batched(&ctx, &t_in, n_heads, head_dim, theta, pos_offset).unwrap();
     assert_bf16_close_elementwise(&download_bf16_as_fp32(&out).unwrap(), &expected);
+}
+
+#[test]
+fn rope_half_split_f16_matches_fp32_reference() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (seq_len, n_heads, head_dim) = (2usize, 3usize, 8usize);
+    let theta = 10000.0f32;
+    let pos_offset = 5u32;
+    let input: Vec<f32> = (0..seq_len * n_heads * head_dim)
+        .map(|index| ((index as f32) * 0.13).cos() * 2.0)
+        .collect();
+
+    let mut expected = vec![0.0f32; input.len()];
+    let half = head_dim / 2;
+    for sequence in 0..seq_len {
+        let position = pos_offset as usize + sequence;
+        for head in 0..n_heads {
+            let base = sequence * n_heads * head_dim + head * head_dim;
+            for pair in 0..half {
+                let frequency =
+                    1.0f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
+                let angle = position as f32 * frequency;
+                let cosine = angle.cos();
+                let sine = angle.sin();
+                let first = input[base + pair];
+                let second = input[base + half + pair];
+                expected[base + pair] = first * cosine - second * sine;
+                expected[base + half + pair] = first * sine + second * cosine;
+            }
+        }
+    }
+
+    let input_f16: Vec<half::f16> =
+        input.iter().map(|value| half::f16::from_f32(*value)).collect();
+    let input_bytes: Vec<u8> = input_f16
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let input_buffer = CudaBuffer::alloc(input_bytes.len(), ctx.device_id()).unwrap();
+    input_buffer.copy_from_host(&input_bytes).unwrap();
+    let input_tensor = input_buffer.into_tensor(
+        Shape::from(vec![seq_len, n_heads, head_dim]),
+        DType::F16,
+    );
+
+    let output = apply_half_split_f16(
+        &ctx,
+        &input_tensor,
+        n_heads,
+        head_dim,
+        theta,
+        pos_offset,
+    )
+    .unwrap();
+    let output_buffer = CudaBuffer::from_tensor(&output).unwrap();
+    let mut output_bytes = vec![0u8; output_buffer.len()];
+    output_buffer.copy_to_host(&mut output_bytes).unwrap();
+    let actual: Vec<f32> = output_bytes
+        .chunks_exact(2)
+        .map(|bytes| half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32())
+        .collect();
+
+    for (actual, expected) in actual.iter().zip(expected.iter()) {
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "actual={actual}, expected={expected}"
+        );
+    }
 }
 
 // ── RoPE (interleaved pairs) ──────────────────────────────────────
