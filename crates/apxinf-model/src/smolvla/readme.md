@@ -58,6 +58,13 @@ elementwise operations.
   attention entirely on the GPU.
 - **GEMM tactics:** exact-shape cuBLAS tactic selection can be supplied through
   `--tactics`; the reported measurements use the tuned Xavier tactic table.
+- **Stream-ordered allocation reuse:** operator outputs use an exact-size,
+  stream-keyed CUDA allocation cache by default. This removes the thousands of
+  blocking `cudaMalloc`/`cudaFree` pairs formerly issued by one inference. Set
+  `APXINF_CUDA_ALLOC_CACHE=0` to disable the cache.
+- **Uninitialized GEMM output:** GEMM writes every output element with
+  `beta = 0`, so its output buffer is allocated without an avoidable
+  `cudaMemset`.
 - **Phase profiling:** CUDA events separately measure preprocessing, prefix
   embedding, VLM transformer, action expert, and output slicing.
 
@@ -92,17 +99,18 @@ GEMM tactic table:
 
 | Stage or metric | p50 latency |
 | --- | ---: |
-| End-to-end | `907.1 ms` |
-| Model | `900.7 ms` |
-| Preprocess | `3.68 ms` |
-| Prefix embedding | `499.0 ms` |
-| VLM transformer | `57.7 ms` |
-| VLM prefix total | `557.9 ms` |
-| Action expert | `332.3 ms` |
+| End-to-end | `395.7 ms` |
+| Model | `390.4 ms` |
+| Preprocess | `4.4 ms` |
+| Prefix embedding | `193.0 ms` |
+| VLM transformer | `29.1 ms` |
+| VLM prefix total | `222.4 ms` |
+| Action expert | `160.8 ms` |
 | Output slicing | `0.09 ms` |
 
-The current dominant cost is prefix embedding, followed by the action expert.
-The VLM transformer itself is comparatively small after the prefix is built.
+With stream-ordered output reuse, the remaining dominant cost is prefix
+embedding, followed by the action expert. The VLM transformer itself is
+comparatively small after the prefix is built.
 
 ## LIBERO spatial result
 

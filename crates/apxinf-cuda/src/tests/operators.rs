@@ -546,6 +546,50 @@ fn rope_half_split_f16_matches_fp32_reference() {
     }
 }
 
+#[test]
+fn f16_matmul_reused_output_overwrites_previous_values() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+
+    fn upload_f16(ctx: &CudaContext, values: &[f32], shape: Vec<usize>) -> Tensor {
+        let encoded: Vec<u8> = values
+            .iter()
+            .flat_map(|value| half::f16::from_f32(*value).to_le_bytes())
+            .collect();
+        let buffer = CudaBuffer::alloc(encoded.len(), ctx.device_id()).unwrap();
+        buffer.copy_from_host(&encoded).unwrap();
+        buffer.into_tensor(Shape::from(shape), DType::F16)
+    }
+
+    fn download_f16(tensor: &Tensor) -> Vec<f32> {
+        let buffer = CudaBuffer::from_tensor(tensor).unwrap();
+        let mut encoded = vec![0u8; buffer.len()];
+        buffer.copy_to_host(&mut encoded).unwrap();
+        encoded
+            .chunks_exact(2)
+            .map(|bytes| half::f16::from_le_bytes([bytes[0], bytes[1]]).to_f32())
+            .collect()
+    }
+
+    let first_input = upload_f16(
+        &ctx,
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        vec![2, 3],
+    );
+    let first_weight =
+        upload_f16(&ctx, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]);
+    let first_output =
+        crate::kernels::gemm::matmul(&ctx, &first_input, &first_weight).unwrap();
+    assert_eq!(download_f16(&first_output), vec![58.0, 64.0, 139.0, 154.0]);
+    drop(first_output);
+
+    let second_input = upload_f16(&ctx, &[1.0; 6], vec![2, 3]);
+    let second_weight =
+        upload_f16(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]);
+    let second_output =
+        crate::kernels::gemm::matmul(&ctx, &second_input, &second_weight).unwrap();
+    assert_eq!(download_f16(&second_output), vec![9.0, 12.0, 9.0, 12.0]);
+}
+
 // ── RoPE (interleaved pairs) ──────────────────────────────────────
 
 #[test]

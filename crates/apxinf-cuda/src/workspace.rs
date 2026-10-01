@@ -252,6 +252,24 @@ pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffe
     })
 }
 
+/// Allocate operator output storage without clearing it.
+///
+/// GEMM writes every output element with `beta = 0`, so clearing a fresh
+/// allocation is avoidable host- and device-side work.
+pub(crate) fn output_buffer_uninitialized(
+    ctx: &CudaContext,
+    bytes: usize,
+) -> Result<CudaBuffer> {
+    ACTIVE_WORKSPACE.with(|active| {
+        let workspace = active.get();
+        if workspace.is_null() {
+            CudaBuffer::alloc_on(ctx, bytes).map_err(Error::Cuda)
+        } else {
+            unsafe { &*workspace }.allocate(bytes, ctx.device_id())
+        }
+    })
+}
+
 /// Like [`output_buffer`], but cleared.
 ///
 /// A fresh driver allocation is not zero either, but the workspace hands back
