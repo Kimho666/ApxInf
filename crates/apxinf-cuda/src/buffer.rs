@@ -495,6 +495,16 @@ impl CudaBuffer {
         })
     }
 
+    /// Rebind a view to an arena lease that owns its lifetime.
+    pub(crate) fn with_owner(&self, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self {
+            ptr: self.ptr,
+            len: self.len,
+            device: self.device,
+            owner,
+        }
+    }
+
     /// Turn an owned CUDA allocation into a Tensor while preserving ownership.
     pub(crate) fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
         let device = Device::Cuda(self.device);

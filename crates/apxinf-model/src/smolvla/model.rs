@@ -8,7 +8,7 @@ use half::{bf16, f16};
 use crate::accelerator::cuda::{
     downcast_arc, kernels, CudaEventTimer, Context, DeviceBuffer, RuntimeBackend,
 };
-use crate::vla::{Observation, VisionObservation};
+use crate::vla::{ImageLayout, Observation, VisionObservation};
 
 use super::{SmolVlaConfig, SmolVlaWeights};
 
@@ -83,6 +83,10 @@ impl SmolVlaModel {
         } else {
             DType::BF16
         }
+    }
+
+    pub(in crate::smolvla) fn config(&self) -> &Arc<SmolVlaConfig> {
+        &self.config
     }
 
     fn add_bias(&self, ctx: &Context, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
@@ -192,7 +196,8 @@ impl SmolVlaModel {
         };
         let prefix_timer = CudaEventTimer::new()?;
         prefix_timer.start(ctx)?;
-        let prefix = self.embed_prefix(&patches, token_ids, token_count, observation)?;
+        let state = self.backend.to_device(&self.prepare_state(observation)?)?;
+        let prefix = self.embed_prefix(&patches, token_ids, token_count, &state)?;
         prefix_timer.stop(ctx)?;
         let vlm_timer = CudaEventTimer::new()?;
         vlm_timer.start(ctx)?;
@@ -202,9 +207,13 @@ impl SmolVlaModel {
         let dt = -1.0 / self.config.num_flow_steps as f32;
         let expert_timer = CudaEventTimer::new()?;
         expert_timer.start(ctx)?;
+        let time_embeddings = self.time_embeddings()?;
         for step in 0..self.config.num_flow_steps {
-            let time = 1.0 + step as f32 * dt;
-            let velocity = self.denoise_step(&state, time, &prefix_states)?;
+            let velocity = self.denoise_step_with_embedding(
+                &state,
+                &time_embeddings[step],
+                &prefix_states,
+            )?;
             if step == 0 {
             }
             state = (if self.fp16_gemm {
@@ -234,12 +243,95 @@ impl SmolVlaModel {
         Ok((output, timing))
     }
 
+    pub(in crate::smolvla) fn time_embeddings(&self) -> Result<Vec<Tensor>> {
+        let dt = -1.0 / self.config.num_flow_steps as f32;
+        (0..self.config.num_flow_steps)
+            .map(|step| self.time_embedding(1.0 + step as f32 * dt))
+            .collect()
+    }
+
+    pub(in crate::smolvla) fn infer_fixed(
+        &self,
+        raw_images: Option<&DeviceBuffer>,
+        patches: &Tensor,
+        state: &Tensor,
+        noise: &Tensor,
+        token_ids: &DeviceBuffer,
+        token_count: usize,
+        layout: ImageLayout,
+        time_embeddings: &[Tensor],
+    ) -> Result<Tensor> {
+        if let Some(raw_images) = raw_images {
+            (if self.fp16_gemm {
+                kernels::preprocess::rgb_u8_to_patches_f16
+            } else {
+                kernels::preprocess::rgb_u8_to_patches_bf16
+            })(
+                self.backend.context(),
+                raw_images,
+                patches,
+                self.config.num_views,
+                self.config.image_size,
+                self.config.patch_size,
+                kernel_layout(layout),
+            )?;
+        }
+        self.infer_parts(
+            patches,
+            state,
+            noise,
+            token_ids,
+            token_count,
+            time_embeddings,
+        )
+    }
+
+    fn infer_parts(
+        &self,
+        patches: &Tensor,
+        state: &Tensor,
+        noise: &Tensor,
+        token_ids: &DeviceBuffer,
+        token_count: usize,
+        time_embeddings: &[Tensor],
+    ) -> Result<Tensor> {
+        if token_count == 0 || token_count > self.config.max_token_len {
+            return Err(Error::Other(format!(
+                "SmolVLA token count must be in 1..={}, got {token_count}",
+                self.config.max_token_len
+            )));
+        }
+        if noise.dtype() != self.dtype()
+            || noise.shape().dims() != [self.config.action_horizon, self.config.max_action_dim]
+        {
+            return Err(Error::Other("SmolVLA initial latent shape mismatch".into()));
+        }
+        let ctx = self.backend.context();
+        let prefix = self.embed_prefix(patches, token_ids, token_count, state)?;
+        let prefix_states = self.encode_prefix(prefix)?;
+        let mut state = noise.clone();
+        let dt = -1.0 / self.config.num_flow_steps as f32;
+        for embedding in time_embeddings {
+            let velocity = self.denoise_step_with_embedding(&state, embedding, &prefix_states)?;
+            state = (if self.fp16_gemm {
+                kernels::elementwise::euler_update_f16
+            } else {
+                kernels::elementwise::euler_update_bf16
+            })(ctx, &state, &velocity, dt)?;
+        }
+        (if self.fp16_gemm {
+            kernels::quantization::slice_columns_f16
+        } else {
+            kernels::quantization::slice_columns_bf16
+        })(ctx, &state, self.config.action_dim)
+    }
+
     fn embed_prefix(
         &self,
         patches: &Tensor,
         token_ids: &DeviceBuffer,
         token_count: usize,
-        observation: &Observation,
+        state: &Tensor,
     ) -> Result<Tensor> {
         let ctx = self.backend.context();
         let vision = self.encode_vision(ctx, patches)?;
@@ -253,7 +345,7 @@ impl SmolVlaModel {
             token_ids,
             token_count,
         )?;
-        let state = self.embed_state(observation)?;
+        let state = self.embed_state(state)?;
         let concat_rows = if self.fp16_gemm {
             kernels::elementwise::concat_rows_f16
         } else {
@@ -393,7 +485,7 @@ impl SmolVlaModel {
         self.backend.add(&projected, &hidden)
     }
 
-    fn embed_state(&self, observation: &Observation) -> Result<Tensor> {
+    pub(in crate::smolvla) fn prepare_state(&self, observation: &Observation) -> Result<Tensor> {
         let state = observation.state.as_ref().ok_or_else(|| {
             Error::Other("SmolVLA observation requires proprioceptive state".into())
         })?;
@@ -420,9 +512,21 @@ impl SmolVlaModel {
                 &padded.into_iter().map(bf16::from_f32).collect::<Vec<_>>(),
             )?
         };
+        Ok(host)
+    }
+
+    fn embed_state(&self, state: &Tensor) -> Result<Tensor> {
+        if state.device() != Device::Cuda(self.backend.device_id())
+            || state.dtype() != self.dtype()
+            || state.shape().dims() != [1, self.config.max_state_dim]
+        {
+            return Err(Error::Other(
+                "SmolVLA fixed state input shape or dtype mismatch".into(),
+            ));
+        }
         let projected = self.gemm(
             self.backend.context(),
-            &self.backend.to_device(&host)?,
+            state,
             &self.weights.state_projection.weight,
         )?;
         self.add_bias(
@@ -562,6 +666,16 @@ impl SmolVlaModel {
         time: f32,
         prefix: &PrefixStates,
     ) -> Result<Tensor> {
+        let embedding = self.time_embedding(time)?;
+        self.denoise_step_with_embedding(state, &embedding, prefix)
+    }
+
+    fn denoise_step_with_embedding(
+        &self,
+        state: &Tensor,
+        embedding: &Tensor,
+        prefix: &PrefixStates,
+    ) -> Result<Tensor> {
         let ctx = self.backend.context();
         let action = self.gemm(ctx, state, &self.weights.action_in.weight)?;
         let action = self.add_bias(
@@ -569,14 +683,13 @@ impl SmolVlaModel {
             &action,
             self.weights.action_in.bias.as_ref().unwrap(),
         )?;
-        let time_embedding = self.time_embedding(time)?;
         let action_time = (if self.fp16_gemm {
             kernels::elementwise::concat_columns_f16
         } else {
             kernels::elementwise::concat_columns_bf16
         })(
             ctx,
-            &[&action, &time_embedding],
+            &[&action, embedding],
         )?;
         let fused = self.gemm(
             ctx,

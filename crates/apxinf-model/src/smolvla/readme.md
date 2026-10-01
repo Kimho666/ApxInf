@@ -100,7 +100,7 @@ The CUDA test
 
 Measurements were taken on the local Xavier `sm_72` GPU with the FP16 variant,
 two `512x512` cameras, and the tuned GEMM tactic table. The baseline used 20
-iterations after 3 warmups; the current result uses 50 iterations after 5
+iterations after 3 warmups; the eager result uses 50 iterations after 3
 warmups:
 
 | Stage or metric | Baseline p50 | Current p50 |
@@ -119,6 +119,17 @@ The action-expert p50 varies between short runs, so the small stage-level
 increase should not be interpreted as a regression from the cross K/V change.
 The remaining dominant costs are still prefix embedding and the action expert;
 the VLM transformer is comparatively small after the prefix is built.
+
+The whole-model CUDA Graph path captures RGB preprocessing, prefix
+construction, cross-attention K/V preparation, all ten action-denoise steps,
+and output slicing in one graph. Its workspace uses lifetime-aware sub-block
+reuse rather than retaining every intermediate at a unique address. On the
+same 50-iteration benchmark, the graph path reaches `312.4 ms` model p50,
+`317.6 ms` end-to-end p50, and `311.9 ms` graph p50. The graph workspace peak
+is about `45 MiB`; a `96 MiB` reservation is used to leave headroom for
+address fragmentation. The fixed-input graph output is bitwise equal to the
+eager output, so the graph changes execution scheduling but not the policy
+computation. Set `APXINF_SMOLVLA_NO_GRAPH=1` to run the fixed eager path.
 ## LIBERO spatial result
 
 The corrected FP16 implementation was evaluated with
@@ -138,12 +149,13 @@ The corrected FP16 implementation was evaluated with
 | Mean model time | `435.3 ms/call` |
 | Mean inference time | `450.1 ms/call` |
 
-The latest run with cross-attention K/V reuse and uninitialized FP16 GEMM
-outputs also completed `8/10`; task `1` and task `4` reached the 520-step
-timeout. This differs from the earlier run's failed tasks (`4` and `7`) even
-though the same seed was used, reflecting LIBERO rollout variability. A
-fixed-input comparison against the pre-optimization output is bitwise equal,
-so the policy computation itself is unchanged.
+The latest pure-eager run (`APXINF_SMOLVLA_NO_GRAPH=1`) completed `6/10`;
+tasks `1`, `4`, `7`, and `8` reached the 520-step timeout. Re-running those
+four failed tasks once succeeded on tasks `1` and `7`, while tasks `4` and `8`
+still timed out. Together with the two earlier `8/10` runs, this indicates
+LIBERO rollout variability despite the fixed seed. A fixed-input comparison
+against the pre-optimization output is bitwise equal, so the policy
+computation itself is unchanged.
 
 ## Validation commands
 

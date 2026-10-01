@@ -448,9 +448,11 @@ pub fn concat_rows_bf16(ctx: &CudaContext, first: &Tensor, second: &Tensor) -> R
     let (first_rows, cols) = matrix_shape(first, "row concatenation")?;
     let (second_rows, second_cols) = matrix_shape(second, "row concatenation")?;
     if first.dtype() != DType::BF16 || second.dtype() != DType::BF16 || cols != second_cols {
-        return Err(Error::Other(
-            "static inference BF16 row concatenation requires matrices with equal widths".into(),
-        ));
+        return Err(Error::Other(format!(
+            "static inference BF16 row concatenation requires matrices with equal widths, got {:?} and {:?}",
+            first.shape().dims(),
+            second.shape().dims()
+        )));
     }
     let output = bf16_output(ctx, first_rows + second_rows, cols)?;
     unsafe {
@@ -800,9 +802,11 @@ pub fn concat_rows_f16(ctx: &CudaContext, first: &Tensor, second: &Tensor) -> Re
     let (first_rows, cols) = matrix_shape(first, "row concatenation")?;
     let (second_rows, second_cols) = matrix_shape(second, "row concatenation")?;
     if first.dtype() != DType::F16 || second.dtype() != DType::F16 || cols != second_cols {
-        return Err(Error::Other(
-            "static inference row concatenation expects FP16 matrices with equal widths".into(),
-        ));
+        return Err(Error::Other(format!(
+            "static inference row concatenation expects FP16 matrices with equal widths, got {:?} and {:?}",
+            first.shape().dims(),
+            second.shape().dims()
+        )));
     }
     let output = f16_output(ctx, first_rows + second_rows, cols)?;
     unsafe {
