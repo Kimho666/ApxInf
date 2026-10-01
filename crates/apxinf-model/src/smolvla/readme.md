@@ -128,12 +128,13 @@ The corrected FP16 implementation was evaluated with
 | Max steps | 520 |
 | Replan interval | 5 actions |
 | Seed | 7 |
-| Mean model time | `880.0 ms/call` |
-| Mean inference time | `894.4 ms/call` |
+| Mean model time | `425.5 ms/call` |
+| Mean inference time | `438.8 ms/call` |
 
 The successful tasks completed in 68–116 environment action steps. The two
-failures reached the 520-step timeout. This result is from the post-RoPE-fix
-FP16 wheel and is not comparable to the earlier all-failure debug run.
+failures reached the 520-step timeout. This result is from the post-RoPE-fix,
+allocation-reuse FP16 wheel and is not comparable to the earlier all-failure
+debug run.
 
 ## Validation commands
 
