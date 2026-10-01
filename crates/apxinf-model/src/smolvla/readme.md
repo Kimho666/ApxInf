@@ -62,9 +62,14 @@ elementwise operations.
   stream-keyed CUDA allocation cache by default. This removes the thousands of
   blocking `cudaMalloc`/`cudaFree` pairs formerly issued by one inference. Set
   `APXINF_CUDA_ALLOC_CACHE=0` to disable the cache.
-- **Uninitialized GEMM output:** GEMM writes every output element with
-  `beta = 0`, so its output buffer is allocated without an avoidable
-  `cudaMemset`.
+- **Cross-attention prefix K/V reuse:** the VLM prefix is fixed across the ten
+  action-denoising steps, so its cross-attention keys and values are projected
+  once after prefix encoding and reused by every step. This removes 144
+  repeated GEMMs per inference while preserving the same inputs, weights, and
+  projections.
+- **Uninitialized FP16 GEMM output:** the FP16 GEMM path writes every output
+  element with `beta = 0`, so its output buffer is allocated without an
+  avoidable `cudaMemset`.
 - **Phase profiling:** CUDA events separately measure preprocessing, prefix
   embedding, VLM transformer, action expert, and output slicing.
 
@@ -94,24 +99,26 @@ The CUDA test
 ## Performance
 
 Measurements were taken on the local Xavier `sm_72` GPU with the FP16 variant,
-two `512x512` cameras, 20 benchmark iterations after 3 warmups, and the tuned
-GEMM tactic table:
+two `512x512` cameras, and the tuned GEMM tactic table. The baseline used 20
+iterations after 3 warmups; the current result uses 50 iterations after 5
+warmups:
 
-| Stage or metric | p50 latency |
-| --- | ---: |
-| End-to-end | `395.7 ms` |
-| Model | `390.4 ms` |
-| Preprocess | `4.4 ms` |
-| Prefix embedding | `193.0 ms` |
-| VLM transformer | `29.1 ms` |
-| VLM prefix total | `222.4 ms` |
-| Action expert | `160.8 ms` |
-| Output slicing | `0.09 ms` |
+| Stage or metric | Baseline p50 | Current p50 |
+| --- | ---: | ---: |
+| End-to-end | `395.7 ms` | `387.0 ms` |
+| Model | `390.4 ms` | `381.9 ms` |
+| Preprocess | `4.4 ms` | `3.5 ms` |
+| Prefix embedding | `193.0 ms` | `183.5 ms` |
+| VLM transformer | `29.1 ms` | `28.3 ms` |
+| VLM prefix total | `222.4 ms` | `211.8 ms` |
+| Action expert | `160.8 ms` | `164.2 ms` |
+| Output slicing | `0.09 ms` | `0.05 ms` |
 
-With stream-ordered output reuse, the remaining dominant cost is prefix
-embedding, followed by the action expert. The VLM transformer itself is
-comparatively small after the prefix is built.
-
+The current end-to-end p50 is about `8.7 ms` lower than the known baseline.
+The action-expert p50 varies between short runs, so the small stage-level
+increase should not be interpreted as a regression from the cross K/V change.
+The remaining dominant costs are still prefix embedding and the action expert;
+the VLM transformer is comparatively small after the prefix is built.
 ## LIBERO spatial result
 
 The corrected FP16 implementation was evaluated with
@@ -128,13 +135,15 @@ The corrected FP16 implementation was evaluated with
 | Max steps | 520 |
 | Replan interval | 5 actions |
 | Seed | 7 |
-| Mean model time | `425.5 ms/call` |
-| Mean inference time | `438.8 ms/call` |
+| Mean model time | `435.3 ms/call` |
+| Mean inference time | `450.1 ms/call` |
 
-The successful tasks completed in 68–116 environment action steps. The two
-failures reached the 520-step timeout. This result is from the post-RoPE-fix,
-allocation-reuse FP16 wheel and is not comparable to the earlier all-failure
-debug run.
+The latest run with cross-attention K/V reuse and uninitialized FP16 GEMM
+outputs also completed `8/10`; task `1` and task `4` reached the 520-step
+timeout. This differs from the earlier run's failed tasks (`4` and `7`) even
+though the same seed was used, reflecting LIBERO rollout variability. A
+fixed-input comparison against the pre-optimization output is bitwise equal,
+so the policy computation itself is unchanged.
 
 ## Validation commands
 

@@ -501,7 +501,35 @@ impl SmolVlaModel {
             &self.weights.text_norm,
             self.config.rms_norm_eps,
         )?;
-        Ok(PrefixStates { keys, values, hidden })
+        let mut cross_keys = Vec::new();
+        let mut cross_values = Vec::new();
+        for (layer_index, layer) in self.weights.expert_layers.iter().enumerate() {
+            let weights = match layer {
+                super::weights::ExpertLayer::CrossAttention(weights) => weights,
+                super::weights::ExpertLayer::SelfAttention(_) => continue,
+            };
+            let prefix_tokens = keys[layer_index].shape().dims()[0];
+            let key = self.gemm(
+                ctx,
+                &keys[layer_index].reshape(vec![prefix_tokens, 320])?,
+                &weights.key.weight,
+            )?;
+            let value = self.gemm(
+                ctx,
+                &values[layer_index].reshape(vec![prefix_tokens, 320])?,
+                &weights.value.weight,
+            )?;
+            let kv_heads = self.config.language_kv_heads;
+            cross_keys.push(key.reshape(vec![prefix_tokens, kv_heads, 64])?);
+            cross_values.push(value.reshape(vec![prefix_tokens, kv_heads, 64])?);
+        }
+        Ok(PrefixStates {
+            keys,
+            values,
+            cross_keys,
+            cross_values,
+            hidden,
+        })
     }
 
     fn mlp(
@@ -571,6 +599,7 @@ impl SmolVlaModel {
             &hidden,
             self.weights.action_time_out.bias.as_ref().unwrap(),
         )?;
+        let mut cross_layer_index = 0;
         for (layer_index, layer) in self.weights.expert_layers.iter().enumerate() {
             hidden = match layer {
                 super::weights::ExpertLayer::SelfAttention(weights) => self.expert_self_layer(
@@ -580,13 +609,12 @@ impl SmolVlaModel {
                     &prefix.keys[layer_index],
                     &prefix.values[layer_index],
                 )?,
-                super::weights::ExpertLayer::CrossAttention(weights) => self.expert_cross_layer(
-                    ctx,
-                    weights,
-                    &hidden,
-                    &prefix.keys[layer_index],
-                    &prefix.values[layer_index],
-                )?,
+                super::weights::ExpertLayer::CrossAttention(weights) => {
+                    let key = &prefix.cross_keys[cross_layer_index];
+                    let value = &prefix.cross_values[cross_layer_index];
+                    cross_layer_index += 1;
+                    self.expert_cross_layer(ctx, weights, &hidden, key, value)?
+                }
             };
         }
         let hidden = (if self.fp16_gemm {
@@ -696,8 +724,8 @@ impl SmolVlaModel {
         ctx: &Context,
         weights: &super::weights::ExpertCrossLayer,
         input: &Tensor,
-        prefix_key: &Tensor,
-        prefix_value: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
     ) -> Result<Tensor> {
         let normalized = (if self.fp16_gemm {
             kernels::norm::rms_f16
@@ -722,27 +750,7 @@ impl SmolVlaModel {
             self.config.rope_theta,
             0,
         )?;
-        let prefix_tokens = prefix_key.shape().dims()[0];
-        let key = self.gemm(
-            ctx,
-            &prefix_key.reshape(vec![prefix_tokens, 320])?,
-            &weights.key.weight,
-        )?;
-        let value = self.gemm(
-            ctx,
-            &prefix_value.reshape(vec![prefix_tokens, 320])?,
-            &weights.value.weight,
-        )?;
-        let key = key.reshape(vec![
-            prefix_tokens,
-            self.config.language_kv_heads,
-            64,
-        ])?;
-        let value = value.reshape(vec![
-            prefix_tokens,
-            self.config.language_kv_heads,
-            64,
-        ])?;
+        let prefix_tokens = key.shape().dims()[0];
         let attention = (if self.fp16_gemm {
             kernels::attention::full_gqa_f16
         } else {
@@ -819,6 +827,8 @@ fn sinusoidal_time_embedding(
 pub struct PrefixStates {
     keys: Vec<Tensor>,
     values: Vec<Tensor>,
+    cross_keys: Vec<Tensor>,
+    cross_values: Vec<Tensor>,
     hidden: Tensor,
 }
 
