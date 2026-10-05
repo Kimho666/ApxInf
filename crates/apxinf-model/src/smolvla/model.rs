@@ -93,7 +93,7 @@ impl SmolVlaModel {
         if self.fp16_gemm {
             kernels::elementwise::bias_f16(ctx, input, Some(bias))
         } else {
-            self.backend.add_bias(input, bias)
+            kernels::elementwise::bias_bf16(ctx, input, Some(bias))
         }
     }
 
@@ -452,12 +452,21 @@ impl SmolVlaModel {
         .reshape(vec![input.shape().dims()[0], self.config.vision_width])?;
         let projected =
             self.gemm(ctx, &attention, &weights.attention_output.weight)?;
-        let projected = self.add_bias(
-            ctx,
-            &projected,
-            weights.attention_output.bias.as_ref().unwrap(),
-        )?;
-        let hidden = self.backend.add(&projected, input)?;
+        let hidden = if self.fp16_gemm {
+            let projected = self.add_bias(
+                ctx,
+                &projected,
+                weights.attention_output.bias.as_ref().unwrap(),
+            )?;
+            self.backend.add(&projected, input)?
+        } else {
+            kernels::fused::bias_then_residual_bf16_packed4(
+                ctx,
+                &projected,
+                Some(weights.attention_output.bias.as_ref().unwrap()),
+                input,
+            )?
+        };
         let normalized = (if self.fp16_gemm {
             kernels::norm::layer_f16
         } else {
@@ -480,9 +489,18 @@ impl SmolVlaModel {
             weights.fc1.bias.as_ref(),
         )?;
         let projected = self.gemm(ctx, &activated, &weights.fc2.weight)?;
-        let projected =
-            self.add_bias(ctx, &projected, weights.fc2.bias.as_ref().unwrap())?;
-        self.backend.add(&projected, &hidden)
+        if self.fp16_gemm {
+            let projected =
+                self.add_bias(ctx, &projected, weights.fc2.bias.as_ref().unwrap())?;
+            self.backend.add(&projected, &hidden)
+        } else {
+            kernels::fused::bias_then_residual_bf16_packed4(
+                ctx,
+                &projected,
+                Some(weights.fc2.bias.as_ref().unwrap()),
+                &hidden,
+            )
+        }
     }
 
     pub(in crate::smolvla) fn prepare_state(&self, observation: &Observation) -> Result<Tensor> {
@@ -851,18 +869,30 @@ impl SmolVlaModel {
             self.config.rms_norm_eps,
         )?;
         let query = self.gemm(ctx, &normalized, &weights.query.weight)?;
-        let query = kernels::rope::apply_half_split_f16(
-            ctx,
-            &query.reshape(vec![
-                input.shape().dims()[0],
-                self.config.language_heads,
-                64,
-            ])?,
+        let query = query.reshape(vec![
+            input.shape().dims()[0],
             self.config.language_heads,
             64,
-            self.config.rope_theta,
-            0,
-        )?;
+        ])?;
+        let query = if self.fp16_gemm {
+            kernels::rope::apply_half_split_f16(
+                ctx,
+                &query,
+                self.config.language_heads,
+                64,
+                self.config.rope_theta,
+                0,
+            )?
+        } else {
+            kernels::rope::apply_batched(
+                ctx,
+                &query,
+                self.config.language_heads,
+                64,
+                self.config.rope_theta,
+                0,
+            )?
+        };
         let prefix_tokens = key.shape().dims()[0];
         let attention = (if self.fp16_gemm {
             kernels::attention::full_gqa_f16

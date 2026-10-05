@@ -719,6 +719,22 @@ pub fn full_gqa_bf16(
             "non-causal BF16 GQA shape mismatch".into(),
         ));
     }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        return fa2_attention(
+            ctx,
+            q,
+            k,
+            v,
+            1,
+            q_shape[0],
+            key_tokens,
+            q_shape[1],
+            k_shape[1],
+            q_shape[2],
+        );
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
     composed_gqa_bf16(ctx, q, k, v, key_tokens, false)
 }
 

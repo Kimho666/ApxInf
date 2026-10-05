@@ -435,16 +435,85 @@ __global__ void row_softmax_f32_bf16_kernel(
   }
 }
 
+__global__ void row_softmax_f32_bf16_rows2_kernel(
+    const float* input, __nv_bfloat16* output, uint32_t cols, uint32_t rows);
+
 extern "C" cudaError_t apxinf_static_row_softmax_f32_bf16(
     const void* input, void* output, uint32_t cols, uint32_t rows,
     cudaStream_t stream) {
   if (input == nullptr || output == nullptr || cols == 0 || rows == 0) {
     return cudaErrorInvalidValue;
   }
+  if (cols == 1024 && rows % 2 == 0) {
+    row_softmax_f32_bf16_rows2_kernel<<<rows / 2, 512, 0, stream>>>(
+        static_cast<const float*>(input),
+        static_cast<__nv_bfloat16*>(output), cols, rows);
+    return cudaGetLastError();
+  }
   row_softmax_f32_bf16_kernel<<<rows, 256, 0, stream>>>(
       static_cast<const float*>(input), static_cast<__nv_bfloat16*>(output),
       cols, rows);
   return cudaGetLastError();
+}
+
+__global__ void row_softmax_f32_bf16_rows2_kernel(
+    const float* input, __nv_bfloat16* output, uint32_t cols,
+    uint32_t rows) {
+  constexpr uint32_t row_threads = 256;
+  constexpr uint32_t rows_per_block = 2;
+  const uint32_t group = threadIdx.x / row_threads;
+  const uint32_t row = blockIdx.x * rows_per_block + group;
+  if (row >= rows) return;
+  const uint32_t tid = threadIdx.x % row_threads;
+  const uint32_t lane = tid & 31;
+  const uint32_t warp = tid >> 5;
+  const float* x = input + static_cast<size_t>(row) * cols;
+  __shared__ float scratch[rows_per_block][32];
+
+  float values[4];
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    values[j] = __ldg(&x[tid + j * row_threads]);
+  }
+
+  float local = -INFINITY;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    local = fmaxf(local, values[j]);
+  }
+  local = warp_max(local);
+  if (lane == 0) scratch[group][warp] = local;
+  __syncthreads();
+  if (warp == 0) {
+    local = lane < row_threads / 32 ? scratch[group][lane] : -INFINITY;
+    local = warp_max(local);
+    if (lane == 0) scratch[group][0] = local;
+  }
+  __syncthreads();
+  const float max_val = scratch[group][0];
+
+  float partial = 0.0f;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    partial += expf(values[j] - max_val);
+  }
+  partial = warp_sum(partial);
+  if (lane == 0) scratch[group][warp] = partial;
+  __syncthreads();
+  if (warp == 0) {
+    partial = lane < row_threads / 32 ? scratch[group][lane] : 0.0f;
+    partial = warp_sum(partial);
+    if (lane == 0) scratch[group][0] = partial;
+  }
+  __syncthreads();
+  const float sum = scratch[group][0];
+
+  __nv_bfloat16* y = output + static_cast<size_t>(row) * cols;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    y[tid + j * row_threads] =
+        __float2bfloat16(expf(values[j] - max_val) / sum);
+  }
 }
 
 // FIX (implement_final_r20): Option A budget repair for the composed hdim256 text

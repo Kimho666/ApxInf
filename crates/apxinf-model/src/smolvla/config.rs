@@ -78,6 +78,8 @@ impl SmolVlaConfig {
             || self.vision_width % self.vision_heads != 0
             || self.language_width % self.language_heads != 0
             || self.language_heads % self.language_kv_heads != 0
+            || self.expert_width == 0
+            || self.expert_mlp_dim == 0
             || self.action_dim > self.max_action_dim
             || self.num_flow_steps == 0
         {
@@ -111,6 +113,21 @@ impl SmolVlaConfig {
         config.num_flow_steps = usize_field(&value, "num_steps", config.num_flow_steps);
         config.time_min_period = f32_field(&value, "min_period", config.time_min_period);
         config.time_max_period = f32_field(&value, "max_period", config.time_max_period);
+        let expert_width_multiplier =
+            f32_field(&value, "expert_width_multiplier", 1.0);
+        if !expert_width_multiplier.is_finite() || expert_width_multiplier <= 0.0 {
+            return Err(Error::Other(
+                "SmolVLA expert_width_multiplier must be positive and finite".into(),
+            ));
+        }
+        if value.get("expert_width_multiplier").is_some() {
+            config.expert_width = (config.language_width as f32
+                * expert_width_multiplier)
+                .round() as usize;
+            config.expert_mlp_dim = (config.language_mlp_dim as f32
+                * expert_width_multiplier)
+                .round() as usize;
+        }
         if let Some(outputs) = value.pointer("/output_features/action/shape").and_then(|x| x.as_array()) {
             if let Some(dim) = outputs.first().and_then(|x| x.as_u64()) {
                 config.action_dim = dim as usize;

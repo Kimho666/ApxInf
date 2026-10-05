@@ -177,6 +177,7 @@ Two views, 512x512 NHWC `uint8`, batch 1.
 | Hardware | Precision | Latency | Throughput |
 |---|---|---:|---:|
 | Jetson Xavier NX | FP16 | 312.38 ms | 3.2 Hz |
+| Jetson AGX Orin | BF16 | 65.8 ms | 15.2 Hz |
 
 
 ## Port a new model with an agent
