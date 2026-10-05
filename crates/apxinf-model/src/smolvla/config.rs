@@ -111,6 +111,22 @@ impl SmolVlaConfig {
         config.max_action_dim = usize_field(&value, "max_action_dim", config.max_action_dim);
         config.action_horizon = usize_field(&value, "chunk_size", config.action_horizon);
         config.num_flow_steps = usize_field(&value, "num_steps", config.num_flow_steps);
+        if let Some(num_vlm_layers) = value.get("num_vlm_layers").and_then(|field| field.as_u64()) {
+            if num_vlm_layers == 0 {
+                config.language_depth = 32;
+            } else {
+                config.language_depth = num_vlm_layers as usize;
+            }
+        }
+        let num_expert_layers = value
+            .get("num_expert_layers")
+            .and_then(|field| field.as_i64())
+            .unwrap_or(-1);
+        if num_expert_layers > 0 && num_expert_layers != config.language_depth as i64 {
+            return Err(Error::Other(
+                "SmolVLA currently requires num_expert_layers to match num_vlm_layers".into(),
+            ));
+        }
         config.time_min_period = f32_field(&value, "min_period", config.time_min_period);
         config.time_max_period = f32_field(&value, "max_period", config.time_max_period);
         let expert_width_multiplier =

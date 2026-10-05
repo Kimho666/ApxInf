@@ -36,6 +36,10 @@ and LIBERO entry points are `scripts/bench_smolvla.py` and
 6. Slice the final latent to the configured action dimensions. For the LIBERO
    checkpoint, the output is `[50, 7]`.
 
+Checkpoint configs use LeRobot's `num_vlm_layers` semantics: `0` means the
+VLM is not cropped, so the LIBERO checkpoint uses all 32 text-model layers.
+Configs without that field retain the historical 16-layer default.
+
 The default model variant is BF16. The optional FP16 variant converts the
 uploaded model tensors to FP16 and uses the FP16 GEMM path, which is
 tensor-core-capable on Xavier's `sm_72`. BF16 and FP16 dispatch to matching
