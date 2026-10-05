@@ -3092,6 +3092,50 @@ pub fn mha_bf16(
     ))
 }
 
+/// BF16 vision MHA for models that prefer FlashAttention-2 on SM80-family.
+/// This dispatch is separate from `mha_bf16` so generic callers keep the
+/// composed cuBLAS route.
+pub fn vision_mha_bf16(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    tokens_per_batch: usize,
+) -> Result<Tensor> {
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let shape = q.shape().dims();
+        if [q, k, v]
+            .into_iter()
+            .any(|tensor| tensor.dtype() != DType::BF16)
+            || shape.len() != 3
+            || k.shape() != q.shape()
+            || v.shape() != q.shape()
+            || shape[2] > 256
+            || tokens_per_batch == 0
+            || shape[0] % tokens_per_batch != 0
+        {
+            return Err(Error::Other(
+                "static inference BF16 vision MHA shape mismatch".into(),
+            ));
+        }
+        return fa2_attention(
+            ctx,
+            q,
+            k,
+            v,
+            shape[0] / tokens_per_batch,
+            tokens_per_batch,
+            tokens_per_batch,
+            shape[1],
+            shape[1],
+            shape[2],
+        );
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    mha_bf16(ctx, q, k, v, tokens_per_batch)
+}
+
 /// Whether the vision tower's head-64 segments use the FlashAttention-2
 /// specialisation. On by default wherever it is compiled.
 ///

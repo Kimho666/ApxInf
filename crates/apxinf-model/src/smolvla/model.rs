@@ -441,7 +441,7 @@ impl SmolVlaModel {
                 self.config.patches_per_view(),
             )?
         } else {
-            kernels::attention::mha_bf16(
+            kernels::attention::vision_mha_bf16(
                 ctx,
                 &qkv.q,
                 &qkv.k,
