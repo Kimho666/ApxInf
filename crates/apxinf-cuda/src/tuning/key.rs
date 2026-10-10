@@ -4,6 +4,7 @@ use crate::device_caps::CudaDeviceCaps;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GemmOp {
+    Fp16,
     Bf16,
     W8A8,
     Fp8F16,

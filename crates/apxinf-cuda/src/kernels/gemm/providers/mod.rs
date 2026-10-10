@@ -39,7 +39,7 @@ pub(super) fn prepare(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
                     value: 0,
                 },
             ),
-            GemmOp::Bf16 | GemmOp::W8A8 => Ok(()),
+            GemmOp::Fp16 | GemmOp::Bf16 | GemmOp::W8A8 => Ok(()),
         },
         TacticBackend::Vendor => Err(Error::Other(format!(
             "invalid vendor tactic {}",
@@ -61,7 +61,10 @@ pub(super) fn candidates(
             value: 0,
         },
     });
-    if matches!(key.op, GemmOp::Bf16 | GemmOp::Fp8F16 | GemmOp::Fp8Bf16) {
+    if matches!(
+        key.op,
+        GemmOp::Fp16 | GemmOp::Bf16 | GemmOp::Fp8F16 | GemmOp::Fp8Bf16
+    ) {
         tactics.extend(
             cublaslt::candidates(key, max_cublaslt_algorithms)
                 .into_iter()

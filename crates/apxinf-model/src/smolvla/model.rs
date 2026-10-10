@@ -110,7 +110,21 @@ impl SmolVlaModel {
                 ),
             ));
         }
-        kernels::gemm::matmul(ctx, activation, weight)
+        kernels::gemm::gemm_f16(ctx, activation, weight)
+    }
+
+    fn gemm_bias(
+        &self,
+        ctx: &Context,
+        activation: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+    ) -> Result<Tensor> {
+        if !self.fp16_gemm {
+            let projected = self.gemm(ctx, activation, weight)?;
+            return self.add_bias(ctx, &projected, bias);
+        }
+        kernels::gemm::gemm_f16_bias(ctx, activation, weight, bias)
     }
 
     pub fn infer(
@@ -208,11 +222,17 @@ impl SmolVlaModel {
         let expert_timer = CudaEventTimer::new()?;
         expert_timer.start(ctx)?;
         let time_embeddings = self.time_embeddings()?;
+        let action_caches = if self.fp16_gemm {
+            Some(self.prepare_action_kv_caches(&prefix_states)?)
+        } else {
+            None
+        };
         for step in 0..self.config.num_flow_steps {
             let velocity = self.denoise_step_with_embedding(
                 &state,
                 &time_embeddings[step],
                 &prefix_states,
+                action_caches.as_ref(),
             )?;
             if step == 0 {
             }
@@ -309,10 +329,20 @@ impl SmolVlaModel {
         let ctx = self.backend.context();
         let prefix = self.embed_prefix(patches, token_ids, token_count, state)?;
         let prefix_states = self.encode_prefix(prefix)?;
+        let action_caches = if self.fp16_gemm {
+            Some(self.prepare_action_kv_caches(&prefix_states)?)
+        } else {
+            None
+        };
         let mut state = noise.clone();
         let dt = -1.0 / self.config.num_flow_steps as f32;
         for embedding in time_embeddings {
-            let velocity = self.denoise_step_with_embedding(&state, embedding, &prefix_states)?;
+            let velocity = self.denoise_step_with_embedding(
+                &state,
+                embedding,
+                &prefix_states,
+                action_caches.as_ref(),
+            )?;
             state = (if self.fp16_gemm {
                 kernels::elementwise::euler_update_f16
             } else {
@@ -420,19 +450,19 @@ impl SmolVlaModel {
             weights.norm1.bias.as_ref().unwrap(),
             self.config.layer_norm_eps,
         )?;
-        let qkv = self.gemm(ctx, &normalized, &weights.qkv.weight)?;
-        let qkv = (if self.fp16_gemm {
-            kernels::attention::split_qkv_bias_f16
-        } else {
-            kernels::attention::split_qkv_bias_bf16
-        })(
-            ctx,
-            &qkv,
-            weights.qkv.bias.as_ref(),
-            self.config.vision_heads,
-            self.config.vision_width / self.config.vision_heads,
-        )?;
         let attention = if self.fp16_gemm {
+            let qkv = self.gemm(
+                ctx,
+                &normalized,
+                &weights.qkv.weight,
+            )?;
+            let qkv = kernels::attention::split_qkv_bias_f16(
+                ctx,
+                &qkv,
+                weights.qkv.bias.as_ref(),
+                self.config.vision_heads,
+                self.config.vision_width / self.config.vision_heads,
+            )?;
             kernels::attention::vision_mha_f16(
                 ctx,
                 &qkv.q,
@@ -441,6 +471,14 @@ impl SmolVlaModel {
                 self.config.patches_per_view(),
             )?
         } else {
+            let qkv = self.gemm(ctx, &normalized, &weights.qkv.weight)?;
+            let qkv = kernels::attention::split_qkv_bias_bf16(
+                ctx,
+                &qkv,
+                weights.qkv.bias.as_ref(),
+                self.config.vision_heads,
+                self.config.vision_width / self.config.vision_heads,
+            )?;
             kernels::attention::vision_mha_bf16(
                 ctx,
                 &qkv.q,
@@ -450,16 +488,17 @@ impl SmolVlaModel {
             )?
         }
         .reshape(vec![input.shape().dims()[0], self.config.vision_width])?;
-        let projected =
-            self.gemm(ctx, &attention, &weights.attention_output.weight)?;
         let hidden = if self.fp16_gemm {
-            let projected = self.add_bias(
+            kernels::gemm::gemm_f16_bias_residual(
                 ctx,
-                &projected,
+                &attention,
+                &weights.attention_output.weight,
                 weights.attention_output.bias.as_ref().unwrap(),
-            )?;
-            self.backend.add(&projected, input)?
+                input,
+            )?
         } else {
+            let projected =
+                self.gemm(ctx, &attention, &weights.attention_output.weight)?;
             kernels::fused::bias_then_residual_bf16_packed4(
                 ctx,
                 &projected,
@@ -478,21 +517,28 @@ impl SmolVlaModel {
             weights.norm2.bias.as_ref().unwrap(),
             self.config.layer_norm_eps,
         )?;
-        let activated = self.gemm(ctx, &normalized, &weights.fc1.weight)?;
-        let activated = (if self.fp16_gemm {
-            kernels::activation::bias_gelu_f16
+        let projected = self.gemm(ctx, &normalized, &weights.fc1.weight)?;
+        let activated = if self.fp16_gemm {
+            kernels::activation::bias_gelu_f16(
+                ctx,
+                &projected,
+                weights.fc1.bias.as_ref(),
+            )?
         } else {
-            kernels::activation::bias_gelu_bf16
-        })(
-            ctx,
-            &activated,
-            weights.fc1.bias.as_ref(),
-        )?;
+            kernels::activation::bias_gelu_bf16(
+                ctx,
+                &projected,
+                weights.fc1.bias.as_ref(),
+            )?
+        };
         let projected = self.gemm(ctx, &activated, &weights.fc2.weight)?;
         if self.fp16_gemm {
-            let projected =
-                self.add_bias(ctx, &projected, weights.fc2.bias.as_ref().unwrap())?;
-            self.backend.add(&projected, &hidden)
+            kernels::fused::bias_residual_f16(
+                ctx,
+                &projected,
+                Some(weights.fc2.bias.as_ref().unwrap()),
+                &hidden,
+            )
         } else {
             kernels::fused::bias_then_residual_bf16_packed4(
                 ctx,
@@ -604,9 +650,18 @@ impl SmolVlaModel {
             .reshape(vec![tokens, self.config.language_width])?;
             if keys.len() == 1 {
             }
-            let projected =
-                self.gemm(ctx, &attention, &layer.attention_output.weight)?;
-            hidden = self.backend.add(&projected, &hidden)?;
+            hidden = if self.fp16_gemm {
+                kernels::gemm::gemm_f16_residual(
+                    ctx,
+                    &attention,
+                    &layer.attention_output.weight,
+                    &hidden,
+                )?
+            } else {
+                let projected =
+                    self.gemm(ctx, &attention, &layer.attention_output.weight)?;
+                self.backend.add(&projected, &hidden)?
+            };
             let mlp_output =
                 self.mlp(ctx, &hidden, &layer.post_norm, &layer.gate_up, &layer.down)?;
             if keys.len() == 1 {
@@ -674,8 +729,12 @@ impl SmolVlaModel {
         } else {
             kernels::activation::swiglu_bf16
         })(ctx, &activated)?;
-        let projected = self.gemm(ctx, &activated, &down.weight)?;
-        self.backend.add(&projected, input)
+        if self.fp16_gemm {
+            kernels::gemm::gemm_f16_residual(ctx, &activated, &down.weight, input)
+        } else {
+            let projected = self.gemm(ctx, &activated, &down.weight)?;
+            self.backend.add(&projected, input)
+        }
     }
 
     fn denoise_step(
@@ -685,7 +744,48 @@ impl SmolVlaModel {
         prefix: &PrefixStates,
     ) -> Result<Tensor> {
         let embedding = self.time_embedding(time)?;
-        self.denoise_step_with_embedding(state, &embedding, prefix)
+        let action_caches = if self.fp16_gemm {
+            Some(self.prepare_action_kv_caches(prefix)?)
+        } else {
+            None
+        };
+        self.denoise_step_with_embedding(state, &embedding, prefix, action_caches.as_ref())
+    }
+
+    fn prepare_action_kv_caches(&self, prefix: &PrefixStates) -> Result<ActionKvCaches> {
+        let ctx = self.backend.context();
+        let kv_heads = self.config.language_kv_heads;
+        let head_dim = self.config.language_width / self.config.language_heads;
+        let kv_width = kv_heads * head_dim;
+        let mut keys = Vec::with_capacity(prefix.keys.len());
+        let mut values = Vec::with_capacity(prefix.values.len());
+        for (key, value) in prefix.keys.iter().zip(prefix.values.iter()) {
+            let key_rows = key.shape().dims()[0];
+            let value_rows = value.shape().dims()[0];
+            let key_cache = kernels::elementwise::prefix_rows_f16(
+                ctx,
+                &key.reshape(vec![key_rows, kv_width])?,
+                self.config.action_horizon,
+            )?
+            .reshape(vec![
+                key_rows + self.config.action_horizon,
+                kv_heads,
+                head_dim,
+            ])?;
+            let value_cache = kernels::elementwise::prefix_rows_f16(
+                ctx,
+                &value.reshape(vec![value_rows, kv_width])?,
+                self.config.action_horizon,
+            )?
+            .reshape(vec![
+                value_rows + self.config.action_horizon,
+                kv_heads,
+                head_dim,
+            ])?;
+            keys.push(key_cache);
+            values.push(value_cache);
+        }
+        Ok(ActionKvCaches { keys, values })
     }
 
     fn denoise_step_with_embedding(
@@ -693,12 +793,13 @@ impl SmolVlaModel {
         state: &Tensor,
         embedding: &Tensor,
         prefix: &PrefixStates,
+        action_caches: Option<&ActionKvCaches>,
     ) -> Result<Tensor> {
         let ctx = self.backend.context();
-        let action = self.gemm(ctx, state, &self.weights.action_in.weight)?;
-        let action = self.add_bias(
+        let action = self.gemm_bias(
             ctx,
-            &action,
+            state,
+            &self.weights.action_in.weight,
             self.weights.action_in.bias.as_ref().unwrap(),
         )?;
         let action_time = (if self.fp16_gemm {
@@ -709,14 +810,10 @@ impl SmolVlaModel {
             ctx,
             &[&action, embedding],
         )?;
-        let fused = self.gemm(
+        let fused = self.gemm_bias(
             ctx,
             &action_time,
             &self.weights.action_time_in.weight,
-        )?;
-        let fused = self.add_bias(
-            ctx,
-            &fused,
             self.weights.action_time_in.bias.as_ref().unwrap(),
         )?;
         let fused = if self.fp16_gemm {
@@ -724,10 +821,10 @@ impl SmolVlaModel {
         } else {
             kernels::activation::silu(ctx, &fused)?
         };
-        let mut hidden = self.gemm(ctx, &fused, &self.weights.action_time_out.weight)?;
-        hidden = self.add_bias(
+        let mut hidden = self.gemm_bias(
             ctx,
-            &hidden,
+            &fused,
+            &self.weights.action_time_out.weight,
             self.weights.action_time_out.bias.as_ref().unwrap(),
         )?;
         let mut cross_layer_index = 0;
@@ -739,6 +836,8 @@ impl SmolVlaModel {
                     &hidden,
                     &prefix.keys[layer_index],
                     &prefix.values[layer_index],
+                    action_caches.map(|caches| &caches.keys[layer_index]),
+                    action_caches.map(|caches| &caches.values[layer_index]),
                 )?,
                 super::weights::ExpertLayer::CrossAttention(weights) => {
                     let key = &prefix.cross_keys[cross_layer_index];
@@ -758,8 +857,12 @@ impl SmolVlaModel {
             &self.weights.expert_norm,
             self.config.rms_norm_eps,
         )?;
-        let velocity = self.gemm(ctx, &hidden, &self.weights.action_out.weight)?;
-        self.add_bias(ctx, &velocity, self.weights.action_out.bias.as_ref().unwrap())
+        self.gemm_bias(
+            ctx,
+            &hidden,
+            &self.weights.action_out.weight,
+            self.weights.action_out.bias.as_ref().unwrap(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -770,6 +873,8 @@ impl SmolVlaModel {
         input: &Tensor,
         prefix_key: &Tensor,
         prefix_value: &Tensor,
+        key_cache: Option<&Tensor>,
+        value_cache: Option<&Tensor>,
     ) -> Result<Tensor> {
         let normalized = (if self.fp16_gemm {
             kernels::norm::rms_f16
@@ -783,70 +888,131 @@ impl SmolVlaModel {
         )?;
         let qkv = self.gemm(ctx, &normalized, &weights.qkv.weight)?;
         let prefix_tokens = prefix_key.shape().dims()[0];
-        let qkv = (if self.fp16_gemm {
-            kernels::rope::split_qkv_apply_f16
-        } else {
-            kernels::rope::split_qkv_apply_bf16
-        })(
-            ctx,
-            &qkv,
-            weights.qkv.bias.as_ref(),
-            self.config.language_heads,
-            self.config.language_kv_heads,
-            64,
-            self.config.rope_theta,
-            prefix_tokens,
-        )?;
         let input_tokens = input.shape().dims()[0];
-        let kv_width = self.config.language_kv_heads * 64;
-        let concat_rows = if self.fp16_gemm {
-            kernels::elementwise::concat_rows_f16
-        } else {
-            kernels::elementwise::concat_rows_bf16
-        };
-        let key = concat_rows(
-            ctx,
-            prefix_key,
-            &qkv.k.reshape(vec![input_tokens, kv_width])?,
-        )?;
-        let value = concat_rows(
-            ctx,
-            prefix_value,
-            &qkv.v.reshape(vec![input_tokens, kv_width])?,
-        )?;
-        let key = key.reshape(vec![
-            key.shape().dims()[0],
-            self.config.language_kv_heads,
-            64,
-        ])?;
-        let value = value.reshape(vec![
-            value.shape().dims()[0],
-            self.config.language_kv_heads,
-            64,
-        ])?;
-        let key_tokens = key.shape().dims()[0];
         let attention = if self.fp16_gemm {
-            kernels::attention::suffix_causal_gqa_f16(
-                ctx,
-                &qkv.q,
-                &key,
-                &value,
-                key_tokens,
-                key_tokens - input_tokens,
-            )?
+            match (key_cache, value_cache) {
+                (Some(key_cache), Some(value_cache)) => {
+                    let query = kernels::rope::apply_q_write_kv_f16(
+                        ctx,
+                        &qkv,
+                        weights.qkv.bias.as_ref(),
+                        self.config.language_heads,
+                        self.config.language_kv_heads,
+                        64,
+                        self.config.rope_theta,
+                        prefix_tokens,
+                        key_cache,
+                        value_cache,
+                        prefix_tokens,
+                    )?;
+                    let key_tokens = key_cache.shape().dims()[0];
+                    kernels::attention::suffix_causal_gqa_f16(
+                        ctx,
+                        &query,
+                        key_cache,
+                        value_cache,
+                        key_tokens,
+                        key_tokens - input_tokens,
+                    )?
+                }
+                (None, None) => {
+                    let split = kernels::rope::split_qkv_apply_f16(
+                        ctx,
+                        &qkv,
+                        weights.qkv.bias.as_ref(),
+                        self.config.language_heads,
+                        self.config.language_kv_heads,
+                        64,
+                        self.config.rope_theta,
+                        prefix_tokens,
+                    )?;
+                    let kv_width = self.config.language_kv_heads * 64;
+                    let concat_rows = kernels::elementwise::concat_rows_f16;
+                    let key = concat_rows(
+                        ctx,
+                        prefix_key,
+                        &split.k.reshape(vec![input_tokens, kv_width])?,
+                    )?;
+                    let value = concat_rows(
+                        ctx,
+                        prefix_value,
+                        &split.v.reshape(vec![input_tokens, kv_width])?,
+                    )?;
+                    let key = key.reshape(vec![
+                        key.shape().dims()[0],
+                        self.config.language_kv_heads,
+                        64,
+                    ])?;
+                    let value = value.reshape(vec![
+                        value.shape().dims()[0],
+                        self.config.language_kv_heads,
+                        64,
+                    ])?;
+                    let key_tokens = key.shape().dims()[0];
+                    kernels::attention::suffix_causal_gqa_f16(
+                        ctx,
+                        &split.q,
+                        &key,
+                        &value,
+                        key_tokens,
+                        key_tokens - input_tokens,
+                    )?
+                }
+                (None, Some(_)) | (Some(_), None) => {
+                    return Err(Error::Other(
+                        "SmolVLA action KV caches must provide both key and value".into(),
+                    ));
+                }
+            }
         } else {
-            kernels::attention::causal_gqa_bf16(
+            let split = kernels::rope::split_qkv_apply_bf16(
                 ctx,
-                &qkv.q,
-                &key,
-                &value,
-                key_tokens,
-            )?
+                &qkv,
+                weights.qkv.bias.as_ref(),
+                self.config.language_heads,
+                self.config.language_kv_heads,
+                64,
+                self.config.rope_theta,
+                prefix_tokens,
+            )?;
+            let kv_width = self.config.language_kv_heads * 64;
+            let concat_rows = kernels::elementwise::concat_rows_bf16;
+            let key = concat_rows(
+                ctx,
+                prefix_key,
+                &split.k.reshape(vec![input_tokens, kv_width])?,
+            )?;
+            let value = concat_rows(
+                ctx,
+                prefix_value,
+                &split.v.reshape(vec![input_tokens, kv_width])?,
+            )?;
+            let key = key.reshape(vec![
+                key.shape().dims()[0],
+                self.config.language_kv_heads,
+                64,
+            ])?;
+            let value = value.reshape(vec![
+                value.shape().dims()[0],
+                self.config.language_kv_heads,
+                64,
+            ])?;
+            let key_tokens = key.shape().dims()[0];
+            kernels::attention::causal_gqa_bf16(ctx, &split.q, &key, &value, key_tokens)?
         }
         .reshape(vec![input_tokens, self.config.language_width])?;
-        let projected =
-            self.gemm(ctx, &attention, &weights.attention_output.weight)?;
-        let hidden = self.backend.add(&projected, input)?;
+        let hidden = if self.fp16_gemm {
+            kernels::gemm::gemm_f16_residual(
+                ctx,
+                &attention,
+                &weights.attention_output.weight,
+                input,
+            )?
+        } else {
+            let projected =
+                self.gemm(ctx, &attention, &weights.attention_output.weight)?;
+            self.backend.add(&projected, input)?
+        };
         self.mlp(ctx, &hidden, &weights.post_norm, &weights.gate_up, &weights.down)
     }
 
@@ -906,9 +1072,18 @@ impl SmolVlaModel {
             prefix_tokens,
         )?
         .reshape(vec![input.shape().dims()[0], self.config.language_width])?;
-        let projected =
-            self.gemm(ctx, &attention, &weights.attention_output.weight)?;
-        let hidden = self.backend.add(&projected, input)?;
+        let hidden = if self.fp16_gemm {
+            kernels::gemm::gemm_f16_residual(
+                ctx,
+                &attention,
+                &weights.attention_output.weight,
+                input,
+            )?
+        } else {
+            let projected =
+                self.gemm(ctx, &attention, &weights.attention_output.weight)?;
+            self.backend.add(&projected, input)?
+        };
         self.mlp(ctx, &hidden, &weights.post_norm, &weights.gate_up, &weights.down)
     }
 
@@ -973,6 +1148,11 @@ pub struct PrefixStates {
     cross_keys: Vec<Tensor>,
     cross_values: Vec<Tensor>,
     hidden: Tensor,
+}
+
+struct ActionKvCaches {
+    keys: Vec<Tensor>,
+    values: Vec<Tensor>,
 }
 
 

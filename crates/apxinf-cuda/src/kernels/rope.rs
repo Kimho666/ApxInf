@@ -1182,18 +1182,25 @@ pub fn apply_q_write_kv_f16(
     let (tokens, width) = matrix_shape(qkv, "cached QKV RoPE")?;
     let expected = (q_heads + 2 * kv_heads) * head_dim;
     let cache_shape = k_cache.shape().dims();
+    let cache_rows = match cache_shape {
+        [rows, cache_head_dim] if kv_heads == 1 && *cache_head_dim == head_dim => *rows,
+        [rows, cache_kv_heads, cache_head_dim]
+            if *cache_kv_heads == kv_heads && *cache_head_dim == head_dim =>
+        {
+            *rows
+        }
+        _ => 0,
+    };
     if qkv.dtype() != DType::F16
         || width != expected
         || head_dim > 256
         || head_dim % 2 != 0
-        || kv_heads != 1
         || bias.is_some_and(|x| x.dtype() != DType::F16 || x.shape().dims() != [expected])
         || k_cache.dtype() != DType::F16
         || v_cache.dtype() != DType::F16
-        || cache_shape.len() != 2
         || v_cache.shape().dims() != cache_shape
-        || cache_shape[1] != head_dim
-        || kv_output_offset + tokens > cache_shape[0]
+        || cache_rows == 0
+        || kv_output_offset + tokens > cache_rows
     {
         return Err(Error::Other(format!(
             "static inference cached QKV RoPE shape mismatch: qkv={:?}, k_cache={cache_shape:?}, v_cache={:?}",

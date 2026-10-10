@@ -865,6 +865,21 @@ extern "C" cudaError_t apxinf_static_concat_rows_f16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_prefix_rows_f16(
+    const void* input, void* output, int rows, int suffix_rows, int cols,
+    cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || rows <= 0 || suffix_rows <= 0 ||
+      cols <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  int blocks = static_cast<int>((count + 255) / 256);
+  blocks = blocks > 1024 ? 1024 : blocks;
+  prefix_rows_f16_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const half*>(input), static_cast<half*>(output), count);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_euler_update_f16(
     const void* state, const void* velocity, void* output, int64_t count,
     float dt, cudaStream_t stream) {
@@ -920,6 +935,17 @@ extern "C" cudaError_t apxinf_static_bias_residual_f16(
     int rows, int cols, cudaStream_t stream) {
   if (rows <= 0 || cols <= 0) return cudaErrorInvalidValue;
   int64_t count = static_cast<int64_t>(rows) * cols;
+  if ((cols & 7) == 0) {
+    int64_t vec_count = count / 8;
+    int blocks = static_cast<int>((vec_count + 255) / 256);
+    blocks = blocks > 1024 ? 1024 : blocks;
+    bias_residual_f16_vec8_kernel<<<blocks, 256, 0, stream>>>(
+        static_cast<const float4*>(projection),
+        static_cast<const float4*>(bias),
+        static_cast<const float4*>(residual),
+        static_cast<float4*>(output), vec_count, cols / 8);
+    return cudaGetLastError();
+  }
   int blocks = static_cast<int>((count + 255) / 256);
   blocks = blocks > 1024 ? 1024 : blocks;
   bias_residual_f16_kernel<<<blocks, 256, 0, stream>>>(
@@ -1028,7 +1054,18 @@ extern "C" cudaError_t apxinf_static_qkv_split_bias_f16(
     const void* qkv, const void* bias, void* q, void* k, void* v,
     int tokens, int projection_width, cudaStream_t stream) {
   if (tokens <= 0 || projection_width <= 0) return cudaErrorInvalidValue;
-  qkv_split_bias_f16_kernel<<<tokens, 256, 0, stream>>>(
+  if ((projection_width & 7) != 0) {
+    qkv_split_bias_f16_kernel<<<tokens, 256, 0, stream>>>(
+        static_cast<const half*>(qkv), static_cast<const half*>(bias),
+        static_cast<half*>(q), static_cast<half*>(k), static_cast<half*>(v),
+        tokens, projection_width);
+    return cudaGetLastError();
+  }
+  const int vectors_per_projection = projection_width / 8;
+  const int count = tokens * vectors_per_projection * 3;
+  const int threads = 256;
+  const int blocks = (count + threads - 1) / threads;
+  qkv_split_bias_f16_vec8_kernel<<<blocks, threads, 0, stream>>>(
       static_cast<const half*>(qkv), static_cast<const half*>(bias),
       static_cast<half*>(q), static_cast<half*>(k), static_cast<half*>(v),
       tokens, projection_width);
@@ -1049,6 +1086,7 @@ extern "C" cudaError_t apxinf_static_mha_flash_f16(
       tokens_per_batch, heads, head_dim);
   return cudaGetLastError();
 }
+
 
 extern "C" cudaError_t apxinf_static_bias_position_f16(
     const void* projection, const void* bias, const void* position,

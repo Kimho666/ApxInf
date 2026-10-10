@@ -300,7 +300,13 @@ fn main() {
     .to_vec();
     generic_sources.push(native.join("kernels/custom/mlp_ops.cu"));
     generic_sources.push(native.join("kernels/custom/gdn_ops.cu"));
-    generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_tma.cpp"));
+    if selection
+        .targets
+        .iter()
+        .any(|target| is_cutlass_sm100_family(&target.cutlass_arch))
+    {
+        generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_tma.cpp"));
+    }
     generic_sources.push(native.join("kernels/custom/attn_ops.cu"));
     generic_sources.push(native.join("kernels/custom/model_ops.cu"));
     generic_sources.push(native.join("tests/framework_backend.cu"));

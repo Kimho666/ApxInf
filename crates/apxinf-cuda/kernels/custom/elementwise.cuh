@@ -194,6 +194,15 @@ __global__ void concat_rows_f16_kernel(
   }
 }
 
+__global__ void prefix_rows_f16_kernel(
+    const half* input, half* output, int64_t count) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    output[index] = input[index];
+  }
+}
+
 __global__ void euler_update_f16_kernel(
     const half* state, const half* velocity, half* output,
     int64_t count, float dt) {

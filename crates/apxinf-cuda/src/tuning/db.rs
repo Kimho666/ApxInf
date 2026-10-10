@@ -489,6 +489,7 @@ fn parse_v1_record(index: usize, value: &serde_json::Value) -> Result<ParsedGemm
     let label = format!("record {index}");
     let op = match required_string(key, "op", &label)? {
         "bf16" => GemmOp::Bf16,
+        "fp16" => GemmOp::Fp16,
         "w8a8" => GemmOp::W8A8,
         "fp8_f16" => GemmOp::Fp8F16,
         "fp8_bf16" => GemmOp::Fp8Bf16,

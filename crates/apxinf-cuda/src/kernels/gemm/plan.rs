@@ -275,6 +275,13 @@ pub const fn default_bf16_tactic() -> TacticId {
     }
 }
 
+pub const fn default_f16_tactic() -> TacticId {
+    TacticId {
+        backend: TacticBackend::Vendor,
+        value: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

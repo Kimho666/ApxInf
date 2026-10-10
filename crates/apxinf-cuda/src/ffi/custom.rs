@@ -397,6 +397,14 @@ extern "C" {
         cols: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_prefix_rows_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        suffix_rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_euler_update_f16(
         state: *const c_void,
         velocity: *const c_void,

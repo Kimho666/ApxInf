@@ -1,8 +1,10 @@
 mod bf16;
+mod f16;
 mod fp8;
 mod plan;
 mod providers;
 mod swiglu;
+pub use f16::{gemm_f16, gemm_f16_bias, gemm_f16_bias_residual, gemm_f16_residual};
 pub use swiglu::bf16_swiglu_checkpoint;
 mod w8a8;
 

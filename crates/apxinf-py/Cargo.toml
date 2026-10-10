@@ -29,3 +29,4 @@ extension-module = ["pyo3/extension-module"]
 # which is only registered on CUDA devices. Without it the extension still
 # imports and reports shapes, but `load` errors for pi05.
 cuda = ["apxinf-model/cuda"]
+cuda-legacy = ["apxinf-model/cuda-legacy"]

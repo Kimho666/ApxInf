@@ -146,6 +146,19 @@ extern "C" {
         key_offset: i32,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
+    pub fn apxinf_static_cublas_gqa_prefix_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        output: *mut c_void,
+        query_tokens: i32,
+        key_tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        shared_tokens: i32,
+        stream: cudaStream_t,
+    ) -> cublasStatus_t;
     pub fn apxinf_static_cublas_mqa_bf16(
         q: *const c_void,
         k: *const c_void,

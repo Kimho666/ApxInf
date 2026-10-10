@@ -105,6 +105,69 @@ extern "C" {
         alpha: f32,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
+    pub fn apxinf_static_set_cublaslt_f16_gemm_heuristic(
+        m: i32,
+        n: i32,
+        k: i32,
+        heuristic_rank: i32,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_prepare_f16_gemm(m: i32, n: i32, k: i32) -> cublasStatus_t;
+    pub fn apxinf_static_f16_gemm(
+        activation: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        stream: cudaStream_t,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_f16_gemm_residual(
+        activation: *const c_void,
+        weight: *const c_void,
+        residual: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        stream: cudaStream_t,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_prepare_f16_gemm_bias(
+        m: i32,
+        n: i32,
+        k: i32,
+        bias: *const c_void,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_f16_gemm_bias(
+        activation: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        stream: cudaStream_t,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_prepare_f16_gemm_bias_residual(
+        m: i32,
+        n: i32,
+        k: i32,
+        bias: *const c_void,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_f16_gemm_bias_residual(
+        activation: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        stream: cudaStream_t,
+    ) -> cublasStatus_t;
     pub fn apxinf_static_autotune_cublaslt_bf16_gemm(
         activation: *const c_void,
         weight: *const c_void,

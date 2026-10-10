@@ -822,6 +822,8 @@ __global__ void flash_attn_decode_bf16_splitk_kernel(
 // a fixed per-thread register array and packed/alignment-specific paths.
 constexpr int kSoftmaxMaxCols = 1024;
 constexpr int kMqaSoftmaxThreads = 128;
+constexpr int kGqaSoftmaxIterations = kSoftmaxMaxCols / 32;
+constexpr int kGqaSoftmaxVectorIterations = kGqaSoftmaxIterations / 2;
 
 __global__ void mqa_softmax_f16_block_kernel(half* data, int rows, int cols) {
   __shared__ float reduction[kMqaSoftmaxThreads];
@@ -913,50 +915,72 @@ __global__ void gqa_softmax_f16_warp_kernel(
   if (row >= rows || lane >= 32) return;
   half* source =
       data + (static_cast<int64_t>(batch) * rows + row) * cols;
-  const int vectors = cols / 2;
-  half2* source2 = reinterpret_cast<half2*>(source);
-  float maximum = -1.0e30f;
-
   if ((cols & 1) == 0) {
-#pragma unroll 4
-    for (int vector = lane; vector < vectors; vector += 32) {
-      const float2 pair = __half22float2(source2[vector]);
-      maximum = fmaxf(maximum, fmaxf(pair.x, pair.y));
+    half2* source2 = reinterpret_cast<half2*>(source);
+    const int vectors = cols / 2;
+    float values[kGqaSoftmaxIterations];
+    float maximum = -1.0e30f;
+#pragma unroll
+    for (int iteration = 0; iteration < kGqaSoftmaxVectorIterations; ++iteration) {
+      const int vector = iteration * 32 + lane;
+      if (vector < vectors) {
+        const float2 pair = __half22float2(source2[vector]);
+        values[2 * iteration] = pair.x;
+        values[2 * iteration + 1] = pair.y;
+      } else {
+        values[2 * iteration] = -1.0e30f;
+        values[2 * iteration + 1] = -1.0e30f;
+      }
+      maximum = fmaxf(maximum, fmaxf(values[2 * iteration], values[2 * iteration + 1]));
     }
-  } else {
-    for (int col = lane; col < cols; col += 32) {
-      maximum = fmaxf(maximum, __half2float(source[col]));
+    maximum = warp_max(maximum);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int iteration = 0; iteration < kGqaSoftmaxVectorIterations; ++iteration) {
+      values[2 * iteration] = __expf(values[2 * iteration] - maximum);
+      values[2 * iteration + 1] = __expf(values[2 * iteration + 1] - maximum);
+      sum += values[2 * iteration] + values[2 * iteration + 1];
     }
+    sum = warp_sum_all(sum);
+    const float inverse = 1.0f / sum;
+
+#pragma unroll
+    for (int iteration = 0; iteration < kGqaSoftmaxVectorIterations; ++iteration) {
+      const int vector = iteration * 32 + lane;
+      if (vector < vectors) {
+        source2[vector] = __floats2half2_rn(
+            values[2 * iteration] * inverse,
+            values[2 * iteration + 1] * inverse);
+      }
+    }
+    return;
+  }
+
+  float values[kGqaSoftmaxIterations];
+  float maximum = -1.0e30f;
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    const int col = iteration * 32 + lane;
+    values[iteration] = col < cols ? __half2float(source[col]) : -1.0e30f;
+    maximum = fmaxf(maximum, values[iteration]);
   }
   maximum = warp_max(maximum);
 
   float sum = 0.0f;
-  if ((cols & 1) == 0) {
-#pragma unroll 4
-    for (int vector = lane; vector < vectors; vector += 32) {
-      const float2 pair = __half22float2(source2[vector]);
-      sum += __expf(pair.x - maximum) + __expf(pair.y - maximum);
-    }
-  } else {
-    for (int col = lane; col < cols; col += 32) {
-      sum += __expf(__half2float(source[col]) - maximum);
-    }
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    values[iteration] = __expf(values[iteration] - maximum);
+    sum += values[iteration];
   }
   sum = warp_sum_all(sum);
   const float inverse = 1.0f / sum;
 
-  if ((cols & 1) == 0) {
-#pragma unroll 4
-    for (int vector = lane; vector < vectors; vector += 32) {
-      const float2 pair = __half22float2(source2[vector]);
-      source2[vector] = __floats2half2_rn(
-          __expf(pair.x - maximum) * inverse,
-          __expf(pair.y - maximum) * inverse);
-    }
-  } else {
-    for (int col = lane; col < cols; col += 32) {
-      source[col] =
-          __float2half(__expf(__half2float(source[col]) - maximum) * inverse);
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    const int col = iteration * 32 + lane;
+    if (col < cols) {
+      source[col] = __float2half(values[iteration] * inverse);
     }
   }
 }
@@ -969,25 +993,73 @@ __global__ void gqa_softmax_f16_causal_warp_kernel(
   if (row >= rows || lane >= 32) return;
   half* source = data + (static_cast<int64_t>(batch) * rows + row) * cols;
   const int valid = offset + row + 1;
+  float values[kGqaSoftmaxIterations];
   float maximum = -1.0e30f;
-  for (int col = lane; col < cols; col += 32) {
-    const float value = col < valid ? __half2float(source[col]) : -1.0e30f;
-    maximum = fmaxf(maximum, value);
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    const int col = iteration * 32 + lane;
+    values[iteration] = col < valid ? __half2float(source[col]) : -1.0e30f;
+    maximum = fmaxf(maximum, values[iteration]);
   }
   maximum = warp_max(maximum);
 
   float sum = 0.0f;
-  for (int col = lane; col < cols; col += 32) {
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    const int col = iteration * 32 + lane;
+    values[iteration] = __expf(values[iteration] - maximum);
     if (col < valid) {
-      sum += __expf(__half2float(source[col]) - maximum);
+      sum += values[iteration];
     }
   }
   sum = warp_sum_all(sum);
   const float inverse = 1.0f / sum;
-  for (int col = lane; col < cols; col += 32) {
-    const float value =
-        col < valid ? __expf(__half2float(source[col]) - maximum) * inverse : 0.0f;
-    source[col] = __float2half(value);
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    const int col = iteration * 32 + lane;
+    if (col < cols) {
+      source[col] =
+          __float2half(col < valid ? values[iteration] * inverse : 0.0f);
+    }
+  }
+}
+
+__global__ void gqa_softmax_f16_prefix_warp_kernel(
+    half* data, int rows, int cols, int batches, int shared_tokens) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.x;
+  const int batch = blockIdx.y;
+  if (row >= rows || lane >= 32) return;
+  half* source = data + (static_cast<int64_t>(batch) * rows + row) * cols;
+  const int valid = row < shared_tokens ? shared_tokens : cols;
+  float values[kGqaSoftmaxIterations];
+  float maximum = -1.0e30f;
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    const int col = iteration * 32 + lane;
+    values[iteration] = col < valid ? __half2float(source[col]) : -1.0e30f;
+    maximum = fmaxf(maximum, values[iteration]);
+  }
+  maximum = warp_max(maximum);
+
+  float sum = 0.0f;
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    const int col = iteration * 32 + lane;
+    values[iteration] = __expf(values[iteration] - maximum);
+    if (col < valid) {
+      sum += values[iteration];
+    }
+  }
+  sum = warp_sum_all(sum);
+  const float inverse = 1.0f / sum;
+#pragma unroll
+  for (int iteration = 0; iteration < kGqaSoftmaxIterations; ++iteration) {
+    const int col = iteration * 32 + lane;
+    if (col < cols) {
+      source[col] =
+          __float2half(col < valid ? values[iteration] * inverse : 0.0f);
+    }
   }
 }
 
@@ -1148,6 +1220,7 @@ __global__ void mha_flash_f16_kernel(
     output[(global_query * heads + head) * head_dim + tid] = __float2half(accumulator);
   }
 }
+
 
 
 __global__ void mqa_bf16_kernel(

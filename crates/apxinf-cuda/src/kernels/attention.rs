@@ -764,12 +764,48 @@ pub fn full_gqa_f16(
         ));
     }
     let output = output_buffer(ctx, q.size_in_bytes())?;
+    let output = make_gpu_tensor(
+        q.shape().clone(),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    );
+    full_gqa_f16_into(ctx, q, k, v, key_tokens, &output)?;
+    Ok(output)
+}
+
+fn full_gqa_f16_into(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    key_tokens: usize,
+    output: &Tensor,
+) -> Result<()> {
+    let q_shape = q.shape().dims();
+    let k_shape = k.shape().dims();
+    if q.dtype() != DType::F16
+        || k.dtype() != DType::F16
+        || v.shape() != k.shape()
+        || q_shape.len() != 3
+        || k_shape.len() != 3
+        || q_shape[1] == 0
+        || q_shape[1] % k_shape[1] != 0
+        || q_shape[2] != k_shape[2]
+        || key_tokens == 0
+        || key_tokens != k_shape[0]
+        || output.dtype() != DType::F16
+        || output.shape().dims() != q_shape
+        || output.device() != Device::Cuda(ctx.device_id())
+    {
+        return Err(Error::Other("non-causal FP16 GQA shape mismatch".into()));
+    }
     unsafe {
         ffi::check_cublas(ffi::apxinf_static_cublas_gqa_f16(
             gpu_ptr(q)?,
             gpu_ptr(k)?,
             gpu_ptr(v)?,
-            output.ptr(),
+            gpu_ptr(output)?,
             q_shape[0] as i32,
             key_tokens as i32,
             q_shape[1] as i32,
@@ -779,12 +815,7 @@ pub fn full_gqa_f16(
         ))
         .map_err(Error::Cuda)?;
     }
-    Ok(make_gpu_tensor(
-        q.shape().clone(),
-        DType::F16,
-        ctx.device_id(),
-        output,
-    ))
+    Ok(())
 }
 
 /// FP16 GQA for a causal suffix following a fully visible prefix.
@@ -870,28 +901,22 @@ pub fn vision_mha_f16(
         ));
     }
     let views = shape[0] / tokens_per_view;
-    let head_width = shape[1]
-        .checked_mul(shape[2])
-        .ok_or_else(|| Error::Other("FP16 vision MHA width overflow".into()))?;
-    let mut output = None;
+    let output = make_gpu_tensor(
+        q.shape().clone(),
+        DType::F16,
+        ctx.device_id(),
+        output_buffer(ctx, q.size_in_bytes())?,
+    );
     for view in 0..views {
         let start = view * tokens_per_view;
         let end = start + tokens_per_view;
         let view_q = row_view_f16(ctx, q, start, end)?;
         let view_k = row_view_f16(ctx, k, start, end)?;
         let view_v = row_view_f16(ctx, v, start, end)?;
-        let view_output = full_gqa_f16(ctx, &view_q, &view_k, &view_v, tokens_per_view)?
-            .reshape(vec![tokens_per_view, head_width])?;
-        output = Some(match output {
-            Some(output) => {
-                super::elementwise::concat_rows_f16(ctx, &output, &view_output)?
-            }
-            None => view_output,
-        });
+        let view_output = row_view_f16(ctx, &output, start, end)?;
+        full_gqa_f16_into(ctx, &view_q, &view_k, &view_v, tokens_per_view, &view_output)?;
     }
-    output
-        .ok_or_else(|| Error::Other("FP16 vision MHA requires at least one view".into()))?
-        .reshape(vec![shape[0], shape[1], shape[2]])
+    Ok(output)
 }
 
 /// Two-block non-causal BF16 GQA used by SmolVLA's prefix.
@@ -946,18 +971,40 @@ pub fn prefix_gqa_f16(
             "prefix FP16 GQA requires 0 < shared tokens < key tokens".into(),
         ));
     }
-    let shared_q = row_view_f16(ctx, q, 0, shared_tokens)?;
-    let shared_k = row_view_f16(ctx, k, 0, shared_tokens)?;
-    let shared_v = row_view_f16(ctx, v, 0, shared_tokens)?;
-    let state_q = row_view_f16(ctx, q, shared_tokens, key_tokens)?;
-    let shared_output =
-        full_gqa_f16(ctx, &shared_q, &shared_k, &shared_v, shared_tokens)?;
-    let state_output = full_gqa_f16(ctx, &state_q, k, v, key_tokens)?;
-    let head_width = q_shape[1] * q_shape[2];
-    let shared_rows = shared_output.reshape(vec![shared_tokens, head_width])?;
-    let state_rows = state_output.reshape(vec![key_tokens - shared_tokens, head_width])?;
-    concat_rows_f16(ctx, &shared_rows, &state_rows)?
-        .reshape(vec![key_tokens, q_shape[1], q_shape[2]])
+    if k.dtype() != DType::F16
+        || v.dtype() != DType::F16
+        || v.shape() != k.shape()
+        || q_shape.len() != 3
+        || k_shape.len() != 3
+        || q_shape[1] == 0
+        || q_shape[1] % k_shape[1] != 0
+        || q_shape[2] != k_shape[2]
+    {
+        return Err(Error::Other("prefix FP16 GQA shape mismatch".into()));
+    }
+    let output = make_gpu_tensor(
+        q.shape().clone(),
+        DType::F16,
+        ctx.device_id(),
+        output_buffer(ctx, q.size_in_bytes())?,
+    );
+    unsafe {
+        ffi::check_cublas(ffi::apxinf_static_cublas_gqa_prefix_f16(
+            gpu_ptr(q)?,
+            gpu_ptr(k)?,
+            gpu_ptr(v)?,
+            output.ptr(),
+            key_tokens as i32,
+            key_tokens as i32,
+            q_shape[1] as i32,
+            k_shape[1] as i32,
+            q_shape[2] as i32,
+            shared_tokens as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(output)
 }
 
 fn row_view_bf16(

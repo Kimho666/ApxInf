@@ -3,12 +3,16 @@ use apxinf_core::{Error, Result};
 use crate::tuning::{Epilogue, GemmOp, GemmTuningKey, TacticBackend, TacticId};
 
 pub(super) fn prepare(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
-    use super::super::{bf16, fp8};
+use super::super::{bf16, f16, fp8};
 
     match (key.op, tactic.backend) {
         (GemmOp::Bf16, TacticBackend::CublasLt) if key.epilogue == Epilogue::None => {
             bf16::set_cublaslt_gemm_heuristic(key.m, key.n, key.k, tactic.value)?;
             bf16::prepare_cublaslt_gemm(key.m, key.n, key.k, false)
+        }
+        (GemmOp::Fp16, TacticBackend::CublasLt) if key.epilogue == Epilogue::None => {
+            f16::set_cublaslt_gemm_heuristic(key.m, key.n, key.k, tactic.value)?;
+            f16::prepare_cublaslt_gemm(key.m, key.n, key.k)
         }
         (GemmOp::Fp8F16, TacticBackend::CublasLt) => match key.epilogue {
             Epilogue::None => {

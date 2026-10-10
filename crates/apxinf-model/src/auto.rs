@@ -320,10 +320,10 @@ impl AutoModel {
         }
 
         if matches!(model_name, "pi05" | "pi05-cuda") {
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "cuda-new")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
-            #[cfg(not(feature = "cuda"))]
+            #[cfg(not(feature = "cuda-new"))]
             return Err(Error::Other("PI0.5 requires CUDA support".into()));
         }
 

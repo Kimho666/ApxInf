@@ -182,6 +182,26 @@ __global__ void bias_gelu_f16_kernel(
   }
 }
 
+__global__ void bias_gelu_f16_vec8_kernel(
+    const float4* __restrict__ input, const float4* __restrict__ bias,
+    float4* __restrict__ output, int64_t vec_count, int vec_cols) {
+  const int64_t stride =
+      static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t v = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       v < vec_count; v += stride) {
+    float4 values = input[v];
+    float4 shifts = bias[v % vec_cols];
+    half* lanes = reinterpret_cast<half*>(&values);
+    const half* biases = reinterpret_cast<const half*>(&shifts);
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane) {
+      lanes[lane] = gelu_tanh_f16_one(
+          __float2half(__half2float(lanes[lane]) + __half2float(biases[lane])));
+    }
+    output[v] = values;
+  }
+}
+
 __global__ void gelu_tanh_bf16_kernel(
     const __nv_bfloat16* input, __nv_bfloat16* output, uint32_t count)
 {
@@ -731,6 +751,37 @@ __global__ void swiglu_f16_kernel(
     const float up = __half2float(gate_up[static_cast<int64_t>(row) * 2 * inner + inner + col]);
     const float silu = gate / (1.0f + expf(-gate));
     output[index] = __float2half(silu * up);
+  }
+}
+
+__global__ void swiglu_f16_vec8_kernel(
+    const float4* __restrict__ gate_up, float4* __restrict__ output,
+    int rows, int inner) {
+  const int64_t vec_per_row = inner / 8;
+  const int64_t vec_count = static_cast<int64_t>(rows) * vec_per_row;
+  const int64_t stride =
+      static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t v = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       v < vec_count; v += stride) {
+    const int64_t row = v / vec_per_row;
+    const int64_t col = (v - row * vec_per_row) * 8;
+    const int64_t base = row * 2 * inner + col;
+    const float4 gate4 =
+        *reinterpret_cast<const float4*>(gate_up + base / 8);
+    const float4 up4 =
+        *reinterpret_cast<const float4*>(gate_up + (base + inner) / 8);
+    const half* gates = reinterpret_cast<const half*>(&gate4);
+    const half* ups = reinterpret_cast<const half*>(&up4);
+    float4 packed;
+    half* outputs = reinterpret_cast<half*>(&packed);
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane) {
+      const float gate = __half2float(gates[lane]);
+      const float up = __half2float(ups[lane]);
+      const float silu = gate / (1.0f + expf(-gate));
+      outputs[lane] = __float2half(silu * up);
+    }
+    output[v] = packed;
   }
 }
 

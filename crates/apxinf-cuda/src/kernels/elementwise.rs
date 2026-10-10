@@ -829,6 +829,40 @@ pub fn concat_rows_f16(ctx: &CudaContext, first: &Tensor, second: &Tensor) -> Re
     ))
 }
 
+/// Copy prefix rows into a larger buffer and reserve an uninitialized suffix.
+///
+/// The suffix is intentionally not initialized; callers must overwrite it before reading.
+pub fn prefix_rows_f16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    suffix_rows: usize,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "FP16 prefix rows")?;
+    if input.dtype() != DType::F16 || suffix_rows == 0 {
+        return Err(Error::Other(
+            "FP16 prefix rows expects a non-empty FP16 matrix and suffix".into(),
+        ));
+    }
+    let output = f16_output(ctx, rows + suffix_rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_prefix_rows_f16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            rows as i32,
+            suffix_rows as i32,
+            cols as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows + suffix_rows, cols]),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 pub fn euler_update_f16(
     ctx: &CudaContext,
     state: &Tensor,

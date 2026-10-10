@@ -267,6 +267,35 @@ __global__ void bias_residual_f16_kernel(
   }
 }
 
+__global__ void bias_residual_f16_vec8_kernel(
+    const float4* __restrict__ projection, const float4* __restrict__ bias,
+    const float4* __restrict__ residual, float4* __restrict__ output,
+    int64_t vec_count, int vec_cols) {
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t vec = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       vec < vec_count; vec += stride) {
+    float4 projected = projection[vec];
+    float4 base = residual[vec];
+    const half* projected_values = reinterpret_cast<const half*>(&projected);
+    const half* base_values = reinterpret_cast<const half*>(&base);
+    float4 shifts{};
+    const half* shift_values = reinterpret_cast<const half*>(&shifts);
+    if (bias != nullptr) {
+      shifts = bias[vec % vec_cols];
+    }
+    float4 result{};
+    half* result_values = reinterpret_cast<half*>(&result);
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane) {
+      float value = __half2float(projected_values[lane]) +
+                    __half2float(base_values[lane]);
+      if (bias != nullptr) value += __half2float(shift_values[lane]);
+      result_values[lane] = __float2half(value);
+    }
+    output[vec] = result;
+  }
+}
+
 __global__ void ada_gate_residual_f16_kernel(
     const half* projection, const half* residual, const half* style,
     half* output, int rows, int cols) {
@@ -354,6 +383,58 @@ __global__ void qkv_split_bias_f16_kernel(
       v[token * projection_width + col - 2 * projection_width] = __float2half(value);
     }
   }
+}
+
+__global__ void qkv_split_bias_f16_vec8_kernel(
+    const half* qkv, const half* bias, half* q, half* k, half* v,
+    int tokens, int projection_width) {
+  const int vectors_per_projection = projection_width / 8;
+  const int fused_vectors = vectors_per_projection * 3;
+  const int count = tokens * fused_vectors;
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  const int token = index / fused_vectors;
+  const int vector = index - token * fused_vectors;
+
+  const uint4 input = reinterpret_cast<const uint4*>(qkv)[index];
+  const half* input_values = reinterpret_cast<const half*>(&input);
+  float bias_values[8];
+  if (bias != nullptr) {
+    const uint4 input_bias = reinterpret_cast<const uint4*>(bias)[vector];
+    const half* packed_bias = reinterpret_cast<const half*>(&input_bias);
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+      bias_values[element] = __half2float(packed_bias[element]);
+    }
+  } else {
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+      bias_values[element] = 0.0f;
+    }
+  }
+  uint4 output;
+  half* output_values = reinterpret_cast<half*>(&output);
+#pragma unroll
+  for (int element = 0; element < 8; ++element) {
+    const float value = __half2float(input_values[element]) +
+                        bias_values[element];
+    output_values[element] = __float2half(value);
+  }
+
+  half* destination;
+  int destination_vector;
+  if (vector < vectors_per_projection) {
+    destination = q;
+    destination_vector = vector;
+  } else if (vector < 2 * vectors_per_projection) {
+    destination = k;
+    destination_vector = vector - vectors_per_projection;
+  } else {
+    destination = v;
+    destination_vector = vector - 2 * vectors_per_projection;
+  }
+  reinterpret_cast<uint4*>(destination)[
+      token * vectors_per_projection + destination_vector] = output;
 }
 
 
